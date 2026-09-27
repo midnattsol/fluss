@@ -352,9 +352,9 @@ public class PeriodicSnapshotManager implements Closeable {
     }
 
     /**
-     * Backoff after consecutive snapshot init failures: twice the current interval per
-     * failure, capped at ten times the interval with jitter, mirroring client retry
-     * conventions. The counter resets on the next successful snapshot.
+     * Backoff after consecutive snapshot init failures: twice the current interval per failure,
+     * capped at ten times the interval with jitter, mirroring client retry conventions. The counter
+     * resets on the next successful snapshot.
      */
     private long retryBackoffDelay(int failures) {
         long interval = snapshotIntervalSupplier.getAsLong();
