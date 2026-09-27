@@ -426,6 +426,43 @@ mod admin_test {
         );
     }
 
+    #[tokio::test]
+    async fn test_describe_tablet_servers() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+        let admin = connection.get_admin().expect("Failed to get admin client");
+
+        // Empty request covers every known TabletServer.
+        let servers = admin
+            .describe_tablet_servers(vec![])
+            .await
+            .expect("describe_tablet_servers must succeed");
+        assert!(
+            !servers.is_empty(),
+            "shared cluster must report at least one tablet server"
+        );
+        for server in &servers {
+            assert!(
+                server.in_sync_replicas <= server.num_replicas,
+                "isr cannot exceed replicas: {server:?}"
+            );
+            assert!(
+                server.active_leader_replicas <= server.num_leader_replicas,
+                "active leaders cannot exceed leaders: {server:?}"
+            );
+        }
+
+        // Unknown servers report zero counts instead of erroring.
+        let unknown = admin
+            .describe_tablet_servers(vec![i32::MAX])
+            .await
+            .expect("unknown servers must report zeros");
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].server_id, i32::MAX);
+        assert_eq!(unknown[0].num_replicas, 0);
+        assert!(unknown[0].is_green());
+    }
+
     /// Helper to assert that an error is a FlussAPIError with the expected code.
     fn assert_api_error(error: fluss::error::Error, expected: FlussError) {
         assert_eq!(

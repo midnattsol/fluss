@@ -36,6 +36,7 @@ mod server_tag;
 mod table;
 mod table_change;
 mod table_stats;
+mod tablet_server_health;
 
 pub use acl::*;
 pub use cluster_health::*;
@@ -58,3 +59,4 @@ pub use server_tag::*;
 pub use table::*;
 pub use table_change::*;
 pub use table_stats::*;
+pub use tablet_server_health::*;

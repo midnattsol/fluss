@@ -24,21 +24,22 @@ use crate::metadata::{
     KvSnapshotLeaseForTable, KvSnapshotMetadata, LakeSnapshot, LakeSnapshotInfo, LatestKvSnapshots,
     PartitionInfo, PartitionSpec, PhysicalTablePath, ProducerOffsets, ProducerTableOffsets,
     RebalanceProgress, RegisterProducerResult, RemoteLogManifestEntry, Schema, SchemaInfo,
-    ServerTag, TableBucket, TableDescriptor, TableInfo, TablePath, TableStats,
+    ServerTag, TableBucket, TableDescriptor, TableInfo, TablePath, TableStats, TabletServersHealth,
 };
 use crate::rpc::message::{
     AcquireKvSnapshotLeaseRequest, AddServerTagRequest, AlterClusterConfigsRequest,
     AlterDatabaseRequest, AlterTableRequest, CancelRebalanceRequest, CreateAclsRequest,
     CreateDatabaseRequest, CreatePartitionRequest, CreateTableRequest, DatabaseExistsRequest,
-    DeleteProducerOffsetsRequest, DescribeClusterConfigsRequest, DropAclsRequest,
-    DropDatabaseRequest, DropKvSnapshotLeaseRequest, DropPartitionRequest, DropTableRequest,
-    GetClusterHealthRequest, GetDatabaseInfoRequest, GetKvSnapshotMetadataRequest,
-    GetLakeSnapshotRequest, GetLatestKvSnapshotsRequest, GetLatestLakeSnapshotRequest,
-    GetProducerOffsetsRequest, GetTableRequest, GetTableSchemaRequestMsg, GetTableStatsRequest,
-    ListAclsRequest, ListDatabaseSummariesRequest, ListDatabasesRequest, ListKvSnapshotsRequest,
-    ListPartitionInfosRequest, ListRebalanceProgressRequest, ListRemoteLogManifestsRequest,
-    ListTablesRequest, RebalanceRequest, RegisterProducerOffsetsRequest,
-    ReleaseKvSnapshotLeaseRequest, RemoveServerTagRequest, TableExistsRequest,
+    DeleteProducerOffsetsRequest, DescribeClusterConfigsRequest, DescribeTabletServersRequest,
+    DropAclsRequest, DropDatabaseRequest, DropKvSnapshotLeaseRequest, DropPartitionRequest,
+    DropTableRequest, GetClusterHealthRequest, GetDatabaseInfoRequest,
+    GetKvSnapshotMetadataRequest, GetLakeSnapshotRequest, GetLatestKvSnapshotsRequest,
+    GetLatestLakeSnapshotRequest, GetProducerOffsetsRequest, GetTableRequest,
+    GetTableSchemaRequestMsg, GetTableStatsRequest, ListAclsRequest, ListDatabaseSummariesRequest,
+    ListDatabasesRequest, ListKvSnapshotsRequest, ListPartitionInfosRequest,
+    ListRebalanceProgressRequest, ListRemoteLogManifestsRequest, ListTablesRequest,
+    RebalanceRequest, RegisterProducerOffsetsRequest, ReleaseKvSnapshotLeaseRequest,
+    RemoveServerTagRequest, TableExistsRequest,
 };
 use crate::rpc::message::{ListOffsetsRequest, OffsetSpec};
 use crate::rpc::{RpcClient, ServerConnection};
@@ -825,6 +826,22 @@ impl FlussAdmin {
             .request(GetClusterHealthRequest::new())
             .await?;
         ClusterHealth::from_pb(&response)
+    }
+
+    /// Describe per-TabletServer health: the same four counters
+    /// [`get_cluster_health`](Self::get_cluster_health) reports cluster-wide,
+    /// scoped to the replicas and leaders hosted by each requested server.
+    /// Empty `server_ids` covers all known TabletServers.
+    pub async fn describe_tablet_servers(
+        &self,
+        server_ids: Vec<i32>,
+    ) -> Result<TabletServersHealth> {
+        let response = self
+            .admin_gateway()
+            .await?
+            .request(DescribeTabletServersRequest::new(server_ids))
+            .await?;
+        crate::metadata::tablet_servers_from_pb(&response)
     }
 
     /// List remote log manifests for a table (optionally scoped to one partition).

@@ -72,6 +72,7 @@ pub enum ApiKey {
     GetClusterHealth,           // 1062
     ListRemoteLogManifests,     // 1063
     ListKvSnapshots,            // 1064
+    DescribeTabletServers,      // 1067
     Unknown(i16),
 }
 
@@ -127,7 +128,10 @@ impl ApiKey {
             | ApiKey::ScanKv
             | ApiKey::GetClusterHealth
             | ApiKey::ListRemoteLogManifests
-            | ApiKey::ListKvSnapshots => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(0))),
+            | ApiKey::ListKvSnapshots
+            | ApiKey::DescribeTabletServers => {
+                Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(0)))
+            }
             // ProduceLog v1 adds historical partition context to requests and responses.
             ApiKey::ProduceLog => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(1))),
             // PutKv v2 adds the storage backpressure error code; v3 adds historical partition
@@ -199,6 +203,7 @@ impl From<i16> for ApiKey {
             1062 => ApiKey::GetClusterHealth,
             1063 => ApiKey::ListRemoteLogManifests,
             1064 => ApiKey::ListKvSnapshots,
+            1067 => ApiKey::DescribeTabletServers,
 
             _ => Unknown(key),
         }
@@ -260,6 +265,7 @@ impl From<ApiKey> for i16 {
             ApiKey::GetClusterHealth => 1062,
             ApiKey::ListRemoteLogManifests => 1063,
             ApiKey::ListKvSnapshots => 1064,
+            ApiKey::DescribeTabletServers => 1067,
             Unknown(x) => x,
         }
     }
@@ -324,6 +330,7 @@ mod tests {
             (1062, ApiKey::GetClusterHealth),
             (1063, ApiKey::ListRemoteLogManifests),
             (1064, ApiKey::ListKvSnapshots),
+            (1067, ApiKey::DescribeTabletServers),
         ];
 
         for (raw, key) in cases {
