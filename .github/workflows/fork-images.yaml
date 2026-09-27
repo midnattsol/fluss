@@ -1,20 +1,20 @@
 # Fork-only release images. Lives on develop, never merges upstream:
 # keep it out of feature branches aimed at apache/fluss.
 #
-# Publishes ghcr.io/midnattsol/fluss:<tag> where <tag> is 1.0.0+patches.N
-# (SemVer build metadata: upstream 1.0.0 base plus our patches).
+# Publishes ghcr.io/midnattsol/fluss:<tag> where <tag> is 1.0.0-midnattsol.N
+# (Upstream 1.0.0 base plus fork patches; hyphen keeps the tag Docker-valid).
 name: Fork server image
 
 on:
   push:
     tags:
-      - '1.0.0+patches.*'
+      - '1.0.0-midnattsol.*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag suffix to publish (e.g. 1.0.0+patches.9-dryrun)'
+        description: 'Image tag suffix to publish (e.g. 1.0.0-midnattsol.9-dryrun)'
         required: true
-        default: '1.0.0+patches.0-dryrun'
+        default: '1.0.0-midnattsol.0-dryrun'
 
 permissions:
   contents: read
@@ -65,7 +65,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/midnattsol/fluss:${{ steps.tag.outputs.value }}
-            ghcr.io/midnattsol/fluss:1.0.0+patches-latest
+            ghcr.io/midnattsol/fluss:1.0.0-midnattsol-latest
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.tag.outputs.value }}
