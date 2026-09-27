@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.fs.FileSystemSafetyNet;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.utils.ExponentialBackoff;
 import org.apache.fluss.utils.MathUtils;
 import org.apache.fluss.utils.concurrent.Executors;
 import org.apache.fluss.utils.concurrent.FutureUtils;
@@ -210,7 +211,16 @@ public class PeriodicSnapshotManager implements Closeable {
                         try {
                             snapshotRunnableOptional = target.initSnapshot();
                         } catch (Exception e) {
-                            LOG.error("Fail to init snapshot during triggering snapshot.", e);
+                            // A transient init failure (e.g. unreachable remote storage)
+                            // must not break the one-shot schedule chain: back off and
+                            // try again instead of going silent until restart.
+                            int retryTime = numberOfConsecutiveFailures.incrementAndGet();
+                            LOG.error(
+                                    "Fail to init snapshot during triggering snapshot of TableBucket {} for the {} time.",
+                                    tableBucket,
+                                    retryTime,
+                                    e);
+                            scheduleNextSnapshot(retryBackoffDelay(retryTime));
                             return;
                         }
                         if (snapshotRunnableOptional.isPresent()) {
@@ -339,6 +349,17 @@ public class PeriodicSnapshotManager implements Closeable {
 
     private void scheduleNextSnapshot() {
         scheduleNextSnapshot(snapshotIntervalSupplier.getAsLong());
+    }
+
+    /**
+     * Backoff after consecutive snapshot init failures: twice the current interval per
+     * failure, capped at ten times the interval with jitter, mirroring client retry
+     * conventions. The counter resets on the next successful snapshot.
+     */
+    private long retryBackoffDelay(int failures) {
+        long interval = snapshotIntervalSupplier.getAsLong();
+        ExponentialBackoff backoff = new ExponentialBackoff(interval, 2, 10 * interval, 0.2);
+        return backoff.backoff(failures);
     }
 
     /** {@link SnapshotRunnable} provider and consumer. */
