@@ -19,12 +19,13 @@ use crate::client::metadata::Metadata;
 use crate::cluster::ServerNode;
 use crate::metadata::{
     AclFilter, AclInfo, AcquireKvSnapshotLeaseResult, ActiveKvSnapshots, AlterConfig,
-    AlterTableChanges, BucketStatsRequest, ClusterHealth, CreateAclResult, DatabaseDescriptor,
-    DatabaseInfo, DatabaseSummary, DescribeConfig, DropAclsFilterResult, GoalType, JsonSerde,
-    KvSnapshotLeaseForTable, KvSnapshotMetadata, LakeSnapshot, LakeSnapshotInfo, LatestKvSnapshots,
-    PartitionInfo, PartitionSpec, PhysicalTablePath, ProducerOffsets, ProducerTableOffsets,
-    RebalanceProgress, RegisterProducerResult, RemoteLogManifestEntry, Schema, SchemaInfo,
-    ServerTag, TableBucket, TableDescriptor, TableInfo, TablePath, TableStats,
+    AlterTableChanges, BucketStats, BucketStatsRequest, ClusterHealth, CreateAclResult,
+    DatabaseDescriptor, DatabaseInfo, DatabaseSummary, DescribeConfig, DropAclsFilterResult,
+    GoalType, JsonSerde, KvSnapshotLeaseForTable, KvSnapshotMetadata, LakeSnapshot,
+    LakeSnapshotInfo, LatestKvSnapshots, PartitionInfo, PartitionSpec, PhysicalTablePath,
+    ProducerOffsets, ProducerTableOffsets, RebalanceProgress, RegisterProducerResult,
+    RemoteLogManifestEntry, Schema, SchemaInfo, ServerTag, TableBucket, TableDescriptor, TableInfo,
+    TablePath, TableStats,
 };
 use crate::rpc::message::{
     AcquireKvSnapshotLeaseRequest, AddServerTagRequest, AlterClusterConfigsRequest,
@@ -568,16 +569,56 @@ impl FlussAdmin {
         buckets_req: Vec<BucketStatsRequest>,
         target_columns: Vec<i32>,
     ) -> Result<TableStats> {
-        let response = self
-            .admin_gateway()
-            .await?
-            .request(GetTableStatsRequest::new(
-                table_id,
-                buckets_req,
-                target_columns,
-            ))
-            .await?;
-        Ok(TableStats::from_pb(&response))
+        // The coordinator does not serve per-bucket stats; like the Java client, fan out
+        // one request per bucket leader directly to tablet servers and fail fast on the
+        // first leg that errors.
+        use crate::cluster::ServerNode;
+        use std::collections::HashMap;
+
+        let mut by_leader: HashMap<i32, (ServerNode, Vec<BucketStatsRequest>)> = HashMap::new();
+        for req in &buckets_req {
+            let bucket = TableBucket::new_with_partition(table_id, req.partition_id, req.bucket_id);
+            let leader = self.metadata.get_leader_for(&bucket).ok_or_else(|| {
+                crate::error::Error::UnexpectedError {
+                    message: format!(
+                        "No leader available for bucket {} of table {}",
+                        req.bucket_id, table_id
+                    ),
+                    source: None,
+                }
+            })?;
+            by_leader
+                .entry(leader.id())
+                .or_insert_with(|| (leader.clone(), Vec::new()))
+                .1
+                .push(req.clone());
+        }
+
+        let mut legs = Vec::with_capacity(by_leader.len());
+        for (_, (node, reqs)) in by_leader {
+            let connection = self.rpc_client.get_connection(&node).await?;
+            let request = GetTableStatsRequest::new(table_id, reqs, target_columns.clone());
+            legs.push(async move {
+                let response = connection.request(request).await?;
+                Ok::<_, crate::error::Error>(response)
+            });
+        }
+        let responses = futures::future::try_join_all(legs).await?;
+
+        // Preserve request order for determinism.
+        let mut by_bucket: HashMap<(Option<i64>, i32), BucketStats> = HashMap::new();
+        for response in &responses {
+            for stats in &TableStats::from_pb(response).buckets {
+                by_bucket.insert((stats.partition_id, stats.bucket_id), stats.clone());
+            }
+        }
+        let mut buckets = Vec::with_capacity(buckets_req.len());
+        for req in &buckets_req {
+            if let Some(stats) = by_bucket.remove(&(req.partition_id, req.bucket_id)) {
+                buckets.push(stats);
+            }
+        }
+        Ok(TableStats { buckets })
     }
 
     /// Get the latest KV snapshots for a table (optionally scoped to one partition).

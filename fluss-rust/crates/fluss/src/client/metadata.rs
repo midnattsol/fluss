@@ -513,7 +513,7 @@ impl Metadata {
         }
     }
 
-    fn get_leader_for(&self, table_bucket: &TableBucket) -> Option<ServerNode> {
+    pub(crate) fn get_leader_for(&self, table_bucket: &TableBucket) -> Option<ServerNode> {
         let cluster = self.cluster.read();
         cluster.leader_for(table_bucket).cloned()
     }

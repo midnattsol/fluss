@@ -17,7 +17,7 @@
 
 #[cfg(test)]
 mod admin_test {
-    use crate::integration::utils::get_shared_cluster;
+    use crate::integration::utils::{get_shared_cluster, wait_for_table_buckets_ready};
     use fluss::client::FlussConnection;
     use fluss::config::Config;
     use fluss::error::FlussError;
@@ -424,6 +424,59 @@ mod admin_test {
             "Expected TableNotExist error, got {:?}",
             error
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_table_stats_fans_out_to_tablets() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+        let admin = connection.get_admin().expect("Failed to get admin client");
+
+        // Row counts come from tablet servers directly; the coordinator path
+        // would answer UnsupportedVersion.
+        let table_path = TablePath::new("fluss", "stats_fanout");
+        let table_schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .primary_key(vec!["id".to_string()])
+            .unwrap()
+            .build()
+            .expect("Failed to build table schema");
+        let table_descriptor = TableDescriptor::builder()
+            .schema(table_schema)
+            .distributed_by(Some(2), vec!["id".to_string()])
+            .property("table.replication.factor", "1")
+            .build()
+            .expect("Failed to build table descriptor");
+        admin
+            .create_table(&table_path, &table_descriptor, true)
+            .await
+            .expect("Failed to create test table");
+        wait_for_table_buckets_ready(&admin, &table_path, &[0, 1]).await;
+        let table_id = admin
+            .get_table_info(&table_path)
+            .await
+            .expect("Failed to get table info")
+            .table_id;
+
+        let stats = admin
+            .get_table_stats(
+                table_id,
+                vec![
+                    fluss::metadata::BucketStatsRequest::new(None, 0),
+                    fluss::metadata::BucketStatsRequest::new(None, 1),
+                ],
+                vec![],
+            )
+            .await
+            .expect("get_table_stats must fan out to tablets");
+        assert_eq!(stats.buckets.len(), 2);
+        let total: i64 = stats.buckets.iter().map(|b| b.row_count.unwrap_or(0)).sum();
+        assert_eq!(total, 0);
+
+        admin
+            .drop_table(&table_path, true)
+            .await
+            .expect("Failed to drop table");
     }
 
     /// Helper to assert that an error is a FlussAPIError with the expected code.
