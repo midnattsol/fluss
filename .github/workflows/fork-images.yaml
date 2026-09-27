@@ -1,0 +1,72 @@
+# Fork-only release images. Lives on develop, never merges upstream:
+# keep it out of feature branches aimed at apache/fluss.
+#
+# Publishes ghcr.io/midnattsol/fluss:<tag> where <tag> is 1.0.0+patches.N
+# (SemVer build metadata: upstream 1.0.0 base plus our patches).
+name: Fork server image
+
+on:
+  push:
+    tags:
+      - '1.0.0+patches.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag suffix to publish (e.g. 1.0.0+patches.9-dryrun)'
+        required: true
+        default: '1.0.0+patches.0-dryrun'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  server-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork develop
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Java 17 (Temurin)
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build server distribution
+        run: ./mvnw -B --no-transfer-progress clean package -pl fluss-dist -am -DskipTests -Dspotless.check.skip=true
+
+      - name: Stage build output for Docker
+        run: |
+          rm -rf docker/fluss/build-target
+          mkdir -p docker/fluss/build-target
+          cp -r build-target/* docker/fluss/build-target/
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push server image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/fluss
+          push: true
+          tags: |
+            ghcr.io/midnattsol/fluss:${{ steps.tag.outputs.value }}
+            ghcr.io/midnattsol/fluss:1.0.0+patches-latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.value }}
+            org.opencontainers.image.source=https://github.com/midnattsol/fluss
