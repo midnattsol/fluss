@@ -55,6 +55,7 @@ import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableBucketReplica;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
@@ -96,6 +97,8 @@ import org.apache.fluss.rpc.messages.CreateTableRequest;
 import org.apache.fluss.rpc.messages.CreateTableResponse;
 import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.DeleteProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.DescribeTabletServersRequest;
+import org.apache.fluss.rpc.messages.DescribeTabletServersResponse;
 import org.apache.fluss.rpc.messages.DropAclsRequest;
 import org.apache.fluss.rpc.messages.DropAclsResponse;
 import org.apache.fluss.rpc.messages.DropDatabaseRequest;
@@ -141,6 +144,7 @@ import org.apache.fluss.rpc.messages.RemoveServerTagByRackRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagByRackResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
+import org.apache.fluss.rpc.messages.TabletServerHealth;
 import org.apache.fluss.rpc.netty.server.Session;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
@@ -205,6 +209,7 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -1727,6 +1732,74 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         response.setNumLeaderReplicas(numLeaderReplicas);
         response.setActiveLeaderReplicas(activeLeaderReplicas);
         response.setStatus(status);
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<DescribeTabletServersResponse> describeTabletServers(
+            DescribeTabletServersRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
+
+        AccessContextEvent<DescribeTabletServersResponse> event =
+                new AccessContextEvent<>(
+                        ctx -> computeTabletServers(ctx, request.getServerIds()));
+        eventManagerSupplier.get().put(event);
+        return event.getResultFuture();
+    }
+
+    @VisibleForTesting
+    static DescribeTabletServersResponse computeTabletServers(
+            CoordinatorContext ctx, int[] serverIds) {
+        Set<Integer> targets = new HashSet<>();
+        if (serverIds == null || serverIds.length == 0) {
+            targets.addAll(ctx.liveOrShuttingDownTabletServers());
+        } else {
+            for (int serverId : serverIds) {
+                targets.add(serverId);
+            }
+        }
+
+        List<TabletServerHealth> servers = new ArrayList<>();
+        for (int serverId : targets) {
+            int numReplicas = 0;
+            int inSyncReplicas = 0;
+            int numLeaderReplicas = 0;
+            int activeLeaderReplicas = 0;
+
+            for (TableBucketReplica replica : ctx.replicasOnTabletServer(serverId)) {
+                TableBucket tb = replica.getTableBucket();
+                numReplicas++;
+
+                Optional<LeaderAndIsr> laiOpt = ctx.getBucketLeaderAndIsr(tb);
+                if (laiOpt.isPresent()) {
+                    LeaderAndIsr lai = laiOpt.get();
+                    if (lai.isr().contains(serverId)) {
+                        inSyncReplicas++;
+                    }
+                    if (lai.leader() == serverId) {
+                        numLeaderReplicas++;
+                        if (ctx.isLeaderActive(tb)) {
+                            activeLeaderReplicas++;
+                        }
+                    }
+                }
+            }
+
+            servers.add(
+                    new TabletServerHealth()
+                            .setServerId(serverId)
+                            .setNumReplicas(numReplicas)
+                            .setInSyncReplicas(inSyncReplicas)
+                            .setNumLeaderReplicas(numLeaderReplicas)
+                            .setActiveLeaderReplicas(activeLeaderReplicas));
+        }
+
+        // Deterministic order regardless of request order.
+        servers.sort(Comparator.comparingInt(TabletServerHealth::getServerId));
+        DescribeTabletServersResponse response = new DescribeTabletServersResponse();
+        response.addAllServers(servers);
         return response;
     }
 

@@ -71,6 +71,7 @@ import org.apache.fluss.rpc.messages.DatabaseExistsRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsResponse;
 import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsRequest;
+import org.apache.fluss.rpc.messages.DescribeTabletServersRequest;
 import org.apache.fluss.rpc.messages.DropAclsRequest;
 import org.apache.fluss.rpc.messages.DropDatabaseRequest;
 import org.apache.fluss.rpc.messages.DropTableRequest;
@@ -1091,6 +1092,18 @@ public class FlussAdmin implements Admin {
     public CompletableFuture<ClusterHealth> getClusterHealth() {
         return gateway.getClusterHealth(new GetClusterHealthRequest())
                 .thenApply(ClientRpcMessageUtils::toClusterHealth);
+    }
+
+    @Override
+    public CompletableFuture<List<TabletServerHealth>> describeTabletServers(
+            List<Integer> serverIds) {
+        int[] ids = new int[serverIds.size()];
+        for (int i = 0; i < serverIds.size(); i++) {
+            ids[i] = serverIds.get(i);
+        }
+        return gateway
+                .describeTabletServers(new DescribeTabletServersRequest().setServerIds(ids))
+                .thenApply(ClientRpcMessageUtils::toTabletServerHealth);
     }
 
     @VisibleForTesting

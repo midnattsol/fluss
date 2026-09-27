@@ -45,6 +45,8 @@ import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.rpc.messages.DescribeTabletServersRequest;
+import org.apache.fluss.rpc.messages.DescribeTabletServersResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetTableStatsRequest;
@@ -753,6 +755,29 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             return failed;
         }
         return coordinatorGateway.getClusterHealth(request);
+    }
+
+    @Override
+    public CompletableFuture<DescribeTabletServersResponse> describeTabletServers(
+            DescribeTabletServersRequest request) {
+        // Tablet servers don't own the per-server health view; we forward the call to the
+        // coordinator over the internal listener, mirroring getClusterHealth above.
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
+
+        if (metadataCache.getCoordinatorServer(interListenerName) == null) {
+            // Fail fast during the startup window before the tablet has received its first
+            // UpdateMetadataRequest from the coordinator. The supplier inside coordinatorGateway
+            // would otherwise block-and-retry, which is not what readiness probes want.
+            CompletableFuture<DescribeTabletServersResponse> failed = new CompletableFuture<>();
+            failed.completeExceptionally(
+                    new StaleMetadataException(
+                            "Tablet server has not yet received coordinator metadata; per-server"
+                                    + " health is unavailable."));
+            return failed;
+        }
+        return coordinatorGateway.describeTabletServers(request);
     }
 
     @Override

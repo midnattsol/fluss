@@ -859,6 +859,26 @@ public interface Admin extends AutoCloseable {
     CompletableFuture<ClusterHealth> getClusterHealth();
 
     /**
+     * Returns per-TabletServer health slices: the same four counters {@link #getClusterHealth()}
+     * reports cluster-wide, scoped to the replicas and leaders hosted by each requested server.
+     * A server is "green" when all its hosted replicas are in-sync ({@code inSyncReplicas ==
+     * numReplicas}) and all its hosted leaders are active ({@code activeLeaderReplicas ==
+     * numLeaderReplicas}).
+     *
+     * <p>This API backs operator safety gates that must reason about one server at a time: an
+     * enforced scale-in gate (refuse to remove a TabletServer that still hosts replicas) and a
+     * per-server rolling-upgrade gate (only advance once the just-restarted server recovered and
+     * the next one is healthy), without requiring unrelated buckets elsewhere to be fully
+     * in-sync.
+     *
+     * @param serverIds ids of the TabletServers to describe; empty means all known servers.
+     * @return a {@link CompletableFuture} that completes with one {@link TabletServerHealth}
+     *     per requested server (servers unknown to the coordinator report zero counts).
+     * @since 1.1
+     */
+    CompletableFuture<List<TabletServerHealth>> describeTabletServers(List<Integer> serverIds);
+
+    /**
      * List per-bucket remote log manifest entries for a table or partition scope.
      *
      * @param tableId the table to query

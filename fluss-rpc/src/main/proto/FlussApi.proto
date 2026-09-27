@@ -843,6 +843,27 @@ message GetClusterHealthResponse {
   required int32 status = 5; // PbClusterHealthStatus: GREEN=0, YELLOW=1, RED=2, UNKNOWN=3
 }
 
+// Per-server health slice for Admin.describeTabletServers (see FIP-41):
+// the same four counters getClusterHealth reports cluster-wide, scoped to
+// the replicas and leaders hosted by one TabletServer. A server is "green"
+// when all its hosted replicas are in ISR and all its hosted leaders are
+// active. Empty server_ids means all known TabletServers.
+message DescribeTabletServersRequest {
+  repeated int32 server_ids = 1;
+}
+
+message TabletServerHealth {
+  required int32 server_id = 1;
+  required int32 num_replicas = 2;
+  required int32 in_sync_replicas = 3;
+  required int32 num_leader_replicas = 4;
+  required int32 active_leader_replicas = 5;
+}
+
+message DescribeTabletServersResponse {
+  repeated TabletServerHealth servers = 1;
+}
+
 
 // --------------- Inner classes ----------------
 message PbApiVersion {

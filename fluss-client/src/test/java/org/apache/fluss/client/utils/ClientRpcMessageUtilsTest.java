@@ -17,6 +17,7 @@
 
 package org.apache.fluss.client.utils;
 
+import org.apache.fluss.client.admin.TabletServerHealth;
 import org.apache.fluss.client.write.KvWriteBatch;
 import org.apache.fluss.client.write.ReadyWriteBatch;
 import org.apache.fluss.memory.MemorySegment;
@@ -27,6 +28,7 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
+import org.apache.fluss.rpc.messages.DescribeTabletServersResponse;
 import org.apache.fluss.rpc.messages.ListPartitionInfosResponse;
 import org.apache.fluss.rpc.messages.PbKeyValue;
 import org.apache.fluss.rpc.messages.PbPartitionInfo;
@@ -196,6 +198,37 @@ class ClientRpcMessageUtilsTest {
             pbPartitionInfo.setBucketCount(bucketCount);
         }
         return pbPartitionInfo;
+    }
+
+    @Test
+    void testToTabletServerHealth() {
+        org.apache.fluss.rpc.messages.TabletServerHealth green =
+                new org.apache.fluss.rpc.messages.TabletServerHealth()
+                        .setServerId(0)
+                        .setNumReplicas(2)
+                        .setInSyncReplicas(2)
+                        .setNumLeaderReplicas(1)
+                        .setActiveLeaderReplicas(1);
+        org.apache.fluss.rpc.messages.TabletServerHealth degraded =
+                new org.apache.fluss.rpc.messages.TabletServerHealth()
+                        .setServerId(1)
+                        .setNumReplicas(2)
+                        .setInSyncReplicas(1)
+                        .setNumLeaderReplicas(0)
+                        .setActiveLeaderReplicas(0);
+        DescribeTabletServersResponse resp =
+                new DescribeTabletServersResponse().addAllServers(Arrays.asList(green, degraded));
+
+        List<TabletServerHealth> servers = ClientRpcMessageUtils.toTabletServerHealth(resp);
+
+        assertThat(servers).hasSize(2);
+        assertThat(servers.get(0).getServerId()).isEqualTo(0);
+        assertThat(servers.get(0).getNumReplicas()).isEqualTo(2);
+        assertThat(servers.get(0).getInSyncReplicas()).isEqualTo(2);
+        assertThat(servers.get(0).isGreen()).isTrue();
+        assertThat(servers.get(1).getServerId()).isEqualTo(1);
+        assertThat(servers.get(1).getInSyncReplicas()).isEqualTo(1);
+        assertThat(servers.get(1).isGreen()).isFalse();
     }
 
     private KvWriteBatch createKvWriteBatch(int bucketId, MergeMode mergeMode) throws Exception {

@@ -18,6 +18,7 @@
 package org.apache.fluss.client.utils;
 
 import org.apache.fluss.client.admin.ClusterHealth;
+import org.apache.fluss.client.admin.TabletServerHealth;
 import org.apache.fluss.client.admin.ClusterHealthStatus;
 import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.admin.ProducerOffsetsResult;
@@ -57,6 +58,7 @@ import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.CreatePartitionRequest;
+import org.apache.fluss.rpc.messages.DescribeTabletServersResponse;
 import org.apache.fluss.rpc.messages.DropPartitionRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenResponse;
@@ -941,6 +943,21 @@ public class ClientRpcMessageUtils {
                 resp.getNumLeaderReplicas(),
                 resp.getActiveLeaderReplicas(),
                 toClusterHealthStatus(resp.getStatus()));
+    }
+
+    public static List<TabletServerHealth> toTabletServerHealth(
+            DescribeTabletServersResponse resp) {
+        List<TabletServerHealth> servers = new ArrayList<>();
+        for (org.apache.fluss.rpc.messages.TabletServerHealth health : resp.getServersList()) {
+            servers.add(
+                    new TabletServerHealth(
+                            health.getServerId(),
+                            health.getNumReplicas(),
+                            health.getInSyncReplicas(),
+                            health.getNumLeaderReplicas(),
+                            health.getActiveLeaderReplicas()));
+        }
+        return servers;
     }
 
     private static ClusterHealthStatus toClusterHealthStatus(int pbStatus) {
