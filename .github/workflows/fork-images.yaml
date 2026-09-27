@@ -36,10 +36,10 @@ jobs:
             echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Set up Java 17 (Temurin)
+      - name: Set up Java 11 (Temurin, project toolchain)
         uses: actions/setup-java@v5
         with:
-          java-version: '17'
+          java-version: '11'
           distribution: 'temurin'
 
       - name: Build server distribution
