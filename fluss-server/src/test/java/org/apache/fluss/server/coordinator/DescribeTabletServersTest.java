@@ -69,8 +69,8 @@ class DescribeTabletServersTest {
         ctx.putBucketLeaderAndIsr(
                 tb, new LeaderAndIsr(0, 1, Arrays.asList(0, 1, 2), Collections.emptyList(), 0, 1));
 
-        Map<Integer, TabletServerHealth> byServer = byServerId(
-                CoordinatorService.computeTabletServers(ctx, new int[0]));
+        Map<Integer, TabletServerHealth> byServer =
+                byServerId(CoordinatorService.computeTabletServers(ctx, new int[0]));
 
         assertThat(byServer.keySet()).containsExactly(0, 1, 2);
         assertCounts(byServer.get(0), 0, 1, 1, 1, 1);
@@ -114,16 +114,15 @@ class DescribeTabletServersTest {
                 tb, new LeaderAndIsr(0, 1, Arrays.asList(0, 1), Collections.emptyList(), 0, 1));
         ctx.addPendingLeaderActivation(tb);
 
-        Map<Integer, TabletServerHealth> byServer = byServerId(
-                CoordinatorService.computeTabletServers(ctx, new int[0]));
+        Map<Integer, TabletServerHealth> byServer =
+                byServerId(CoordinatorService.computeTabletServers(ctx, new int[0]));
 
         // The leader is hosted but not active yet: leadership counts, activeness does not.
         assertCounts(byServer.get(0), 0, 1, 1, 1, 0);
         assertCounts(byServer.get(1), 1, 1, 1, 0, 0);
     }
 
-    private static Map<Integer, TabletServerHealth> byServerId(
-            DescribeTabletServersResponse resp) {
+    private static Map<Integer, TabletServerHealth> byServerId(DescribeTabletServersResponse resp) {
         Map<Integer, TabletServerHealth> byServer = new HashMap<>();
         for (TabletServerHealth server : resp.getServersList()) {
             byServer.put(server.getServerId(), server);

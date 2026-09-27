@@ -207,9 +207,8 @@ public interface AdminReadOnlyGateway extends RpcGateway {
 
     /**
      * Get per-TabletServer health slices: the same four counters {@link
-     * #getClusterHealth(GetClusterHealthRequest)} reports cluster-wide, scoped to the
-     * replicas and leaders hosted by each requested server. An empty request
-     * covers all known TabletServers.
+     * #getClusterHealth(GetClusterHealthRequest)} reports cluster-wide, scoped to the replicas and
+     * leaders hosted by each requested server. An empty request covers all known TabletServers.
      *
      * @return one health slice per requested server.
      */
