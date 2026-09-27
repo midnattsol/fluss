@@ -1743,8 +1743,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
 
         AccessContextEvent<DescribeTabletServersResponse> event =
-                new AccessContextEvent<>(
-                        ctx -> computeTabletServers(ctx, request.getServerIds()));
+                new AccessContextEvent<>(ctx -> computeTabletServers(ctx, request.getServerIds()));
         eventManagerSupplier.get().put(event);
         return event.getResultFuture();
     }

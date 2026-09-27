@@ -18,10 +18,10 @@
 package org.apache.fluss.client.utils;
 
 import org.apache.fluss.client.admin.ClusterHealth;
-import org.apache.fluss.client.admin.TabletServerHealth;
 import org.apache.fluss.client.admin.ClusterHealthStatus;
 import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.admin.ProducerOffsetsResult;
+import org.apache.fluss.client.admin.TabletServerHealth;
 import org.apache.fluss.client.lookup.LookupBatch;
 import org.apache.fluss.client.lookup.PrefixLookupBatch;
 import org.apache.fluss.client.metadata.AcquireKvSnapshotLeaseResult;

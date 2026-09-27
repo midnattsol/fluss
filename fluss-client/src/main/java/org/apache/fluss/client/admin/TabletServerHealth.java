@@ -23,8 +23,8 @@ import java.util.Objects;
 
 /**
  * Per-TabletServer health slice returned by {@link Admin#describeTabletServers(java.util.List)}:
- * the four counters {@link ClusterHealth} reports cluster-wide, scoped to the replicas and
- * leaders hosted by one server.
+ * the four counters {@link ClusterHealth} reports cluster-wide, scoped to the replicas and leaders
+ * hosted by one server.
  *
  * @since 1.1
  */

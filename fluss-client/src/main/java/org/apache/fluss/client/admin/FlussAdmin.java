@@ -1101,8 +1101,7 @@ public class FlussAdmin implements Admin {
         for (int i = 0; i < serverIds.size(); i++) {
             ids[i] = serverIds.get(i);
         }
-        return gateway
-                .describeTabletServers(new DescribeTabletServersRequest().setServerIds(ids))
+        return gateway.describeTabletServers(new DescribeTabletServersRequest().setServerIds(ids))
                 .thenApply(ClientRpcMessageUtils::toTabletServerHealth);
     }
 
