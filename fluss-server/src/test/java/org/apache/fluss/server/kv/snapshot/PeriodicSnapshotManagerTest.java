@@ -107,6 +107,29 @@ class PeriodicSnapshotManagerTest {
     }
 
     @Test
+    void testScheduleContinuesAfterInitFailureWithBackoff() {
+        // initSnapshot fails twice, then reports no data: the one-shot schedule chain must
+        // survive every failure with growing delays instead of going silent until restart.
+        FailNTimesSnapshotTarget target = new FailNTimesSnapshotTarget(2);
+        periodicSnapshotManager = createSnapshotManager(target);
+        periodicSnapshotManager.start();
+        checkOnlyOneScheduledTasks();
+
+        // First failure: chain alive, delayed at least one interval out.
+        scheduledExecutorService.triggerNonPeriodicScheduledTasks();
+        assertChainAlive();
+        long firstDelay = scheduledDelayMillis();
+
+        // Second failure: chain alive, delayed further out (backoff growth).
+        scheduledExecutorService.triggerNonPeriodicScheduledTasks();
+        assertChainAlive();
+        long secondDelay = scheduledDelayMillis();
+
+        assertThat(secondDelay).isGreaterThan(firstDelay);
+        assertThat(firstDelay).isGreaterThanOrEqualTo(periodicMaterializeDelay);
+    }
+
+    @Test
     void testSnapshotWithException() {
         // use local filesystem to make the FileSystem plugin happy
         String remoteDir = "file:/test/snapshot1";
@@ -191,6 +214,15 @@ class PeriodicSnapshotManagerTest {
                 .isLessThanOrEqualTo(periodicMaterializeDelay);
     }
 
+    private void assertChainAlive() {
+        assertThat(scheduledExecutorService.getAllScheduledTasks()).hasSize(1);
+    }
+
+    private long scheduledDelayMillis() {
+        return getOnlyElement(scheduledExecutorService.getAllScheduledTasks().iterator())
+                .getDelay(MILLISECONDS);
+    }
+
     private PeriodicSnapshotManager createSnapshotManager(
             PeriodicSnapshotManager.SnapshotTarget target) {
         return createSnapshotManager(periodicMaterializeDelay, target);
@@ -216,6 +248,47 @@ class PeriodicSnapshotManagerTest {
 
         @Override
         public Optional<PeriodicSnapshotManager.SnapshotRunnable> initSnapshot() {
+            return Optional.empty();
+        }
+
+        @Override
+        public void handleSnapshotResult(
+                long snapshotId,
+                int coordinatorEpoch,
+                int bucketLeaderEpoch,
+                SnapshotLocation snapshotLocation,
+                SnapshotResult snapshotResult) {}
+
+        @Override
+        public void handleSnapshotFailure(
+                long snapshotId, SnapshotLocation snapshotLocation, Throwable cause) {}
+
+        @Override
+        public long getSnapshotSize() {
+            return 0L;
+        }
+    }
+
+    /** Fails {@link #initSnapshot()} a fixed number of times, then reports no data. */
+    private static class FailNTimesSnapshotTarget
+            implements PeriodicSnapshotManager.SnapshotTarget {
+        private int remainingFailures;
+
+        FailNTimesSnapshotTarget(int failures) {
+            this.remainingFailures = failures;
+        }
+
+        @Override
+        public long currentSnapshotId() {
+            return 0;
+        }
+
+        @Override
+        public Optional<PeriodicSnapshotManager.SnapshotRunnable> initSnapshot() {
+            if (remainingFailures > 0) {
+                remainingFailures--;
+                throw new FlussRuntimeException("transient init failure");
+            }
             return Optional.empty();
         }
 
