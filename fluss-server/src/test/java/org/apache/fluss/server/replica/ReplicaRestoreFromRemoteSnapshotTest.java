@@ -33,6 +33,7 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
+import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.DefaultSnapshotContext;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotDataDownloader;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotDownloadSpec;
@@ -58,8 +59,10 @@ import javax.annotation.Nullable;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -99,8 +102,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         RemoteRestoreSnapshotContext context = new RemoteRestoreSnapshotContext(remoteDir);
         CompletedSnapshot remoteSnapshot = writeDataAndTakeSnapshot(context);
         // Writes after the snapshot must be recovered by replaying the log from its offset.
-        putRecordsToLeader(
-                context.replica, genKvRecordBatch(Tuple2.of("k3", new Object[] {3, "c"})));
+        putRecordsToLeader(context.replica, genKvRecordBatch(new Object[] {3, "c"}));
         wipeLocalKvState(context.replica);
 
         RemoteRestoreSnapshotContext freshContext = new RemoteRestoreSnapshotContext(remoteDir);
@@ -113,9 +115,9 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         List<Tuple2<byte[], byte[]>> expectedKeyValues =
                 getKeyValuePairs(
                         genKvRecords(
-                                Tuple2.of("k1", new Object[] {1, "a"}),
-                                Tuple2.of("k2", new Object[] {2, "b"}),
-                                Tuple2.of("k3", new Object[] {3, "c"})));
+                                new Object[] {1, "a"},
+                                new Object[] {2, "b"},
+                                new Object[] {3, "c"}));
         assertHasKeyValues(restored.getKvTablet(), expectedKeyValues);
     }
 
@@ -126,7 +128,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
 
         // Current behavior is untouched: a healthy but empty tablet, no download, no lease.
         assertThat(restored.getKvTablet()).isNotNull();
-        assertKeyMissing(restored.getKvTablet(), Tuple2.of("k1", new Object[] {1, "a"}));
+        assertKeyMissing(restored.getKvTablet(), new Object[] {1, "a"});
         assertThat(freshContext.downloadEvents).isEmpty();
         assertThat(freshContext.leaseEvents).isEmpty();
     }
@@ -159,9 +161,13 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         freshContext.remoteRestoreEnabled = false;
         Replica restored = makeFreshLeader(freshContext);
 
-        // Kill-switch off: current behavior even with a remote snapshot present.
+        // Kill-switch off: the remote snapshot is ignored and the data is recovered from the
+        // log instead, without any download or lease.
         assertThat(restored.getKvTablet()).isNotNull();
-        assertKeyMissing(restored.getKvTablet(), Tuple2.of("k1", new Object[] {1, "a"}));
+        flushAndWait(restored.getKvTablet(), restored.getLocalLogEndOffset());
+        assertHasKeyValues(
+                restored.getKvTablet(),
+                getKeyValuePairs(genKvRecords(new Object[] {1, "a"}, new Object[] {2, "b"})));
         assertThat(freshContext.downloadEvents).isEmpty();
         assertThat(freshContext.leaseEvents).isEmpty();
     }
@@ -201,7 +207,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         CompletedSnapshot remoteSnapshot =
                 setupContext.testKvSnapshotStore.waitUntilSnapshotComplete(TABLE_BUCKET, 0);
         // Writes after the snapshot must be recovered by replaying the log from its offset.
-        putRecordsToLeader(setupReplica, genKvRecordBatch(Tuple2.of("k3", new Object[] {3, "c"})));
+        putRecordsToLeader(setupReplica, genKvRecordBatch(new Object[] {3, "c"}));
         wipeLocalKvState(setupReplica);
 
         // A partially uploaded snapshot (directory without _METADATA yet) must be skipped.
@@ -212,6 +218,18 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
                                 TABLE_BUCKET)
                         .toString();
         assertThat(new File(tabletDir, "snap-999").mkdirs()).isTrue();
+        // In production the coordinator persists the snapshot metadata file into the snapshot
+        // directory when committing (see CompletedSnapshotStore); the fake committer used above
+        // skips that step, so materialize it here to model the production remote layout that the
+        // listing fallback parses.
+        Files.write(
+                new File(
+                                tabletDir,
+                                FlussPaths.REMOTE_KV_SNAPSHOT_DIR_PREFIX
+                                        + remoteSnapshot.getSnapshotID()
+                                        + "/_METADATA")
+                        .toPath(),
+                CompletedSnapshotJsonSerde.toJson(remoteSnapshot));
 
         KvSnapshotLeaseManager leaseManager = newCoordinatorLeaseManager();
         LeaseForwardingGateway gateway = new LeaseForwardingGateway(leaseManager);
@@ -234,9 +252,9 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         List<Tuple2<byte[], byte[]>> expectedKeyValues =
                 getKeyValuePairs(
                         genKvRecords(
-                                Tuple2.of("k1", new Object[] {1, "a"}),
-                                Tuple2.of("k2", new Object[] {2, "b"}),
-                                Tuple2.of("k3", new Object[] {3, "c"})));
+                                new Object[] {1, "a"},
+                                new Object[] {2, "b"},
+                                new Object[] {3, "c"}));
         assertHasKeyValues(restored.getKvTablet(), expectedKeyValues);
         // The lease pinned the download through the coordinator and is released afterwards.
         assertThat(
@@ -261,7 +279,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
 
         // Current healthy-empty behavior is untouched: an empty tablet, restored from the log.
         assertThat(restored.getKvTablet()).isNotNull();
-        assertKeyMissing(restored.getKvTablet(), Tuple2.of("k1", new Object[] {1, "a"}));
+        assertKeyMissing(restored.getKvTablet(), new Object[] {1, "a"});
     }
 
     private CompletedSnapshot writeDataAndTakeSnapshot(RemoteRestoreSnapshotContext context)
@@ -274,11 +292,10 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
     private Replica startLeaderWithSnapshotData(TestSnapshotContext context) throws Exception {
         Replica replica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET, context);
         makeKvReplicaAsLeader(replica, INITIAL_LEADER_EPOCH);
-        putRecordsToLeader(
-                replica,
-                genKvRecordBatch(
-                        Tuple2.of("k1", new Object[] {1, "a"}),
-                        Tuple2.of("k2", new Object[] {2, "b"})));
+        // Keys are derived from the row's primary-key columns (see PKBasedKvRecordFactory): log
+        // replay re-encodes keys from the logged rows, so the test data must use
+        // schema-consistent keys for replayed writes to land on the expected keys.
+        putRecordsToLeader(replica, genKvRecordBatch(new Object[] {1, "a"}, new Object[] {2, "b"}));
         context.scheduledExecutorService.triggerAllNonPeriodicTasks();
         return replica;
     }
@@ -290,7 +307,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
     }
 
     private void wipeLocalKvState(Replica replica) {
-        makeKvReplicaAsFollower(replica, INITIAL_LEADER_EPOCH);
+        makeKvReplicaAsFollower(replica, INITIAL_LEADER_EPOCH + 1);
         assertThat(replica.getKvTablet()).isNull();
     }
 
@@ -299,15 +316,17 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
     }
 
     private void makeKvReplicaAsFollower(Replica replica, int leaderEpoch) {
+        int newLeaderId = TABLET_SERVER_ID + 1;
+        List<Integer> replicas = Arrays.asList(TABLET_SERVER_ID, newLeaderId);
         replica.makeFollower(
                 new NotifyLeaderAndIsrData(
                         PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
                         TABLE_BUCKET,
-                        Collections.singletonList(TABLET_SERVER_ID),
+                        replicas,
                         new LeaderAndIsr(
-                                TABLET_SERVER_ID,
+                                newLeaderId,
                                 leaderEpoch,
-                                Collections.singletonList(TABLET_SERVER_ID),
+                                replicas,
                                 Collections.emptyList(),
                                 INITIAL_COORDINATOR_EPOCH,
                                 // we also use the leader epoch as bucket epoch
@@ -355,15 +374,15 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
             keys.add(expectedKeyValue.f0);
             expectedValues.add(expectedKeyValue.f1);
         }
+        List<ByteArraySlice> values = kvTablet.multiGet(keys);
         assertThat(
-                        kvTablet.multiGet(keys).stream()
-                                .map(ByteArraySlice::toByteArray)
+                        values.stream()
+                                .map(slice -> slice == null ? null : slice.toByteArray())
                                 .collect(Collectors.toList()))
                 .containsExactlyElementsOf(expectedValues);
     }
 
-    private void assertKeyMissing(KvTablet kvTablet, Tuple2<String, Object[]> record)
-            throws IOException {
+    private void assertKeyMissing(KvTablet kvTablet, Object[] record) throws IOException {
         byte[] key = getKeyValuePairs(genKvRecords(record)).get(0).f0;
         List<ByteArraySlice> values = kvTablet.multiGet(Collections.singletonList(key));
         assertThat(values).hasSize(1);
