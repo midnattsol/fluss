@@ -19,6 +19,7 @@ package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.utils.function.FunctionWithException;
@@ -81,15 +82,17 @@ public interface SnapshotContext {
      * {@link #getLatestCompletedSnapshotProvider()}, which serves the local snapshot view, this
      * looks up snapshots whose files live in remote storage so that an empty replica (e.g. after
      * total local loss) can bootstrap from them. Snapshots whose metadata can no longer be read are
-     * skipped.
+     * skipped. When no snapshot exists anywhere, an empty result is returned and callers keep their
+     * current healthy-empty behavior.
      *
+     * @param physicalPath the physical path of the table, locating the bucket in remote storage
      * @param tableBucket the table bucket to discover the remote snapshot for
      * @return the latest readable remote snapshot, or {@link Optional#empty()} when no remote
      *     snapshot exists
      * @throws Exception if discovering the remote snapshots failed
      */
-    default Optional<CompletedSnapshot> getLatestRemoteSnapshot(TableBucket tableBucket)
-            throws Exception {
+    default Optional<CompletedSnapshot> getLatestRemoteSnapshot(
+            PhysicalTablePath physicalPath, TableBucket tableBucket) throws Exception {
         return Optional.empty();
     }
 

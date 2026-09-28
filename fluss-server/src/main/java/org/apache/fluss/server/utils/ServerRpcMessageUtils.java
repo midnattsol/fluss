@@ -2329,6 +2329,89 @@ public class ServerRpcMessageUtils {
         return pbRebalancePlanForBucket;
     }
 
+    /**
+     * Build an {@link AcquireKvSnapshotLeaseRequest} pinning a single kv snapshot for the given
+     * table bucket. Tablet servers use this to ask the coordinator for a snapshot lease (e.g. to
+     * protect a remote snapshot while an empty replica downloads it).
+     *
+     * @param leaseId the lease id, unique per lease holder
+     * @param tableBucket the table bucket the snapshot belongs to
+     * @param snapshotId the id of the snapshot to pin
+     * @param leaseDurationMs the lease duration in milliseconds
+     * @return the request to send to the coordinator
+     */
+    public static AcquireKvSnapshotLeaseRequest makeAcquireKvSnapshotLeaseRequest(
+            String leaseId, TableBucket tableBucket, long snapshotId, long leaseDurationMs) {
+        AcquireKvSnapshotLeaseRequest request = new AcquireKvSnapshotLeaseRequest();
+        request.setLeaseId(leaseId).setLeaseDurationMs(leaseDurationMs);
+        PbKvSnapshotLeaseForBucket pbLeaseForBucket =
+                new PbKvSnapshotLeaseForBucket()
+                        .setBucketId(tableBucket.getBucket())
+                        .setSnapshotId(snapshotId);
+        if (tableBucket.getPartitionId() != null) {
+            pbLeaseForBucket.setPartitionId(tableBucket.getPartitionId());
+        }
+        request.addSnapshotsToLease()
+                .setTableId(tableBucket.getTableId())
+                .addAllBucketSnapshots(Collections.singletonList(pbLeaseForBucket));
+        return request;
+    }
+
+    /**
+     * Build a {@link ReleaseKvSnapshotLeaseRequest} releasing the given table buckets from a kv
+     * snapshot lease previously acquired from the coordinator.
+     *
+     * @param leaseId the lease id returned when the lease was acquired
+     * @param bucketsToRelease the table buckets to release
+     * @return the request to send to the coordinator
+     */
+    public static ReleaseKvSnapshotLeaseRequest makeReleaseKvSnapshotLeaseRequest(
+            String leaseId, Collection<TableBucket> bucketsToRelease) {
+        ReleaseKvSnapshotLeaseRequest request = new ReleaseKvSnapshotLeaseRequest();
+        request.setLeaseId(leaseId);
+        List<PbTableBucket> pbTableBuckets = new ArrayList<>(bucketsToRelease.size());
+        for (TableBucket tableBucket : bucketsToRelease) {
+            PbTableBucket pbBucket =
+                    new PbTableBucket()
+                            .setTableId(tableBucket.getTableId())
+                            .setBucketId(tableBucket.getBucket());
+            if (tableBucket.getPartitionId() != null) {
+                pbBucket.setPartitionId(tableBucket.getPartitionId());
+            }
+            pbTableBuckets.add(pbBucket);
+        }
+        request.addAllBucketsToReleases(pbTableBuckets);
+        return request;
+    }
+
+    /**
+     * Parse the unavailable snapshots from an {@link AcquireKvSnapshotLeaseResponse} into a map
+     * from table bucket to the snapshot id that failed to be leased.
+     *
+     * @param response the response received from the coordinator
+     * @return the unavailable snapshots, empty when every requested snapshot was leased
+     */
+    public static Map<TableBucket, Long> getUnavailableSnapshots(
+            AcquireKvSnapshotLeaseResponse response) {
+        Map<TableBucket, Long> unavailableSnapshots = new HashMap<>();
+        for (PbKvSnapshotLeaseForTable unavailableSnapshot :
+                response.getUnavailableSnapshotsList()) {
+            long tableId = unavailableSnapshot.getTableId();
+            for (PbKvSnapshotLeaseForBucket leaseForBucket :
+                    unavailableSnapshot.getBucketSnapshotsList()) {
+                TableBucket tableBucket =
+                        new TableBucket(
+                                tableId,
+                                leaseForBucket.hasPartitionId()
+                                        ? leaseForBucket.getPartitionId()
+                                        : null,
+                                leaseForBucket.getBucketId());
+                unavailableSnapshots.put(tableBucket, leaseForBucket.getSnapshotId());
+            }
+        }
+        return unavailableSnapshots;
+    }
+
     public static Map<Long, List<TableBucketSnapshot>> getAcquireKvSnapshotLeaseData(
             AcquireKvSnapshotLeaseRequest request) {
         Map<Long, List<TableBucketSnapshot>> tableIdToLeasedBucket = new HashMap<>();

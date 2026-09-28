@@ -862,7 +862,7 @@ public final class Replica {
      *
      * @return the snapshot used to init kv tablet, empty if no any snapshot.
      */
-    private Optional<CompletedSnapshot> initKvTablet() {
+    private Optional<CompletedSnapshot> initKvTablet() throws Exception {
         checkNotNull(kvManager);
         TableConfig tableConfig = getTableConfig();
         long startTime = clock.milliseconds();
@@ -1086,7 +1086,7 @@ public final class Replica {
             return Optional.empty();
         }
         try {
-            return snapshotContext.getLatestRemoteSnapshot(tableBucket);
+            return snapshotContext.getLatestRemoteSnapshot(physicalPath, tableBucket);
         } catch (Exception e) {
             LOG.warn(
                     "Get latest remote snapshot for {} of table {} failed, will restore from log.",

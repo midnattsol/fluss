@@ -19,31 +19,55 @@ package org.apache.fluss.server.replica;
 
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableBucketSnapshot;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.server.coordinator.TestCoordinatorGateway;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
+import org.apache.fluss.server.kv.snapshot.DefaultSnapshotContext;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotDataDownloader;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotDownloadSpec;
 import org.apache.fluss.server.kv.snapshot.RemoteSnapshotLease;
+import org.apache.fluss.server.kv.snapshot.SnapshotContext;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.LogAppendInfo;
+import org.apache.fluss.server.metrics.group.TestingMetricGroups;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
 import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.CloseableRegistry;
+import org.apache.fluss.utils.FlussPaths;
+import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.types.Tuple2;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import javax.annotation.Nullable;
+
 import java.io.File;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -142,10 +166,113 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         assertThat(freshContext.leaseEvents).isEmpty();
     }
 
+    @Test
+    void testLeaseViaCoordinatorVisibleToCoordinatorManager() throws Exception {
+        KvSnapshotLeaseManager leaseManager = newCoordinatorLeaseManager();
+        LeaseForwardingGateway gateway = new LeaseForwardingGateway(leaseManager);
+        DefaultSnapshotContext context = newDefaultSnapshotContext(gateway);
+        long leaseDurationMs = TimeUnit.MINUTES.toMillis(30);
+
+        RemoteSnapshotLease lease =
+                context.acquireRemoteSnapshotLease(TABLE_BUCKET, 7L, leaseDurationMs);
+
+        // The lease went through the coordinator RPC path, so the coordinator-side in-memory
+        // manager protects the snapshot. A direct-ZK write would stay invisible here.
+        assertThat(leaseManager.snapshotLeaseExist(new TableBucketSnapshot(TABLE_BUCKET, 7L)))
+                .isTrue();
+        assertThat(gateway.lastLeaseId).startsWith("restore-");
+        assertThat(gateway.lastLeaseDurationMs).isEqualTo(leaseDurationMs);
+
+        lease.close();
+
+        // The matching release went through the coordinator as well: the in-memory ref-count is
+        // gone and the ZK lease record is dropped.
+        assertThat(leaseManager.snapshotLeaseExist(new TableBucketSnapshot(TABLE_BUCKET, 7L)))
+                .isFalse();
+        assertThat(leaseManager.getLease(gateway.lastLeaseId).isPresent()).isFalse();
+    }
+
+    @Test
+    void testS3ListingFallbackRecoversWhenZkEmpty() throws Exception {
+        // Real snapshot flow writes files into the production remote layout. The ZK snapshot
+        // handle store stays empty: snapshots are only committed to the fake local store.
+        TestSnapshotContext setupContext = new TestSnapshotContext(productionRemoteKvDir());
+        Replica setupReplica = startLeaderWithSnapshotData(setupContext);
+        CompletedSnapshot remoteSnapshot =
+                setupContext.testKvSnapshotStore.waitUntilSnapshotComplete(TABLE_BUCKET, 0);
+        // Writes after the snapshot must be recovered by replaying the log from its offset.
+        putRecordsToLeader(setupReplica, genKvRecordBatch(Tuple2.of("k3", new Object[] {3, "c"})));
+        wipeLocalKvState(setupReplica);
+
+        // A partially uploaded snapshot (directory without _METADATA yet) must be skipped.
+        String tabletDir =
+                FlussPaths.remoteKvTabletDir(
+                                FlussPaths.remoteKvDir(conf),
+                                DATA1_PHYSICAL_TABLE_PATH_PK,
+                                TABLE_BUCKET)
+                        .toString();
+        assertThat(new File(tabletDir, "snap-999").mkdirs()).isTrue();
+
+        KvSnapshotLeaseManager leaseManager = newCoordinatorLeaseManager();
+        LeaseForwardingGateway gateway = new LeaseForwardingGateway(leaseManager);
+        DefaultSnapshotContext freshContext = newDefaultSnapshotContext(gateway);
+
+        // ZK yields nothing, so discovery falls back to listing remote storage and parses the
+        // snapshot metadata with the existing serde: assert parsed fields, not strings.
+        Optional<CompletedSnapshot> discovered =
+                freshContext.getLatestRemoteSnapshot(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET);
+        assertThat(discovered.isPresent()).isTrue();
+        assertThat(discovered.get().getSnapshotID()).isEqualTo(remoteSnapshot.getSnapshotID());
+        assertThat(discovered.get().getLogOffset()).isEqualTo(remoteSnapshot.getLogOffset());
+        assertThat(discovered.get().getTableBucket()).isEqualTo(TABLE_BUCKET);
+        assertThat(discovered.get().getRowCount()).isEqualTo(remoteSnapshot.getRowCount());
+
+        Replica restored = makeFreshLeader(freshContext);
+
+        assertThat(restored.getKvTablet()).isNotNull();
+        flushAndWait(restored.getKvTablet(), restored.getLocalLogEndOffset());
+        List<Tuple2<byte[], byte[]>> expectedKeyValues =
+                getKeyValuePairs(
+                        genKvRecords(
+                                Tuple2.of("k1", new Object[] {1, "a"}),
+                                Tuple2.of("k2", new Object[] {2, "b"}),
+                                Tuple2.of("k3", new Object[] {3, "c"})));
+        assertHasKeyValues(restored.getKvTablet(), expectedKeyValues);
+        // The lease pinned the download through the coordinator and is released afterwards.
+        assertThat(
+                        leaseManager.snapshotLeaseExist(
+                                new TableBucketSnapshot(
+                                        TABLE_BUCKET, remoteSnapshot.getSnapshotID())))
+                .isFalse();
+    }
+
+    @Test
+    void testS3EmptyStaysHealthyEmpty() throws Exception {
+        DefaultSnapshotContext freshContext = newDefaultSnapshotContext(null);
+
+        // No snapshot anywhere: ZK is empty and remote storage holds nothing.
+        assertThat(
+                        freshContext
+                                .getLatestRemoteSnapshot(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET)
+                                .isPresent())
+                .isFalse();
+
+        Replica restored = makeFreshLeader(freshContext);
+
+        // Current healthy-empty behavior is untouched: an empty tablet, restored from the log.
+        assertThat(restored.getKvTablet()).isNotNull();
+        assertKeyMissing(restored.getKvTablet(), Tuple2.of("k1", new Object[] {1, "a"}));
+    }
+
     private CompletedSnapshot writeDataAndTakeSnapshot(RemoteRestoreSnapshotContext context)
             throws Exception {
-        Replica replica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET, context);
+        Replica replica = startLeaderWithSnapshotData(context);
         context.replica = replica;
+        return context.testKvSnapshotStore.waitUntilSnapshotComplete(TABLE_BUCKET, 0);
+    }
+
+    private Replica startLeaderWithSnapshotData(TestSnapshotContext context) throws Exception {
+        Replica replica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET, context);
         makeKvReplicaAsLeader(replica, INITIAL_LEADER_EPOCH);
         putRecordsToLeader(
                 replica,
@@ -153,10 +280,10 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
                         Tuple2.of("k1", new Object[] {1, "a"}),
                         Tuple2.of("k2", new Object[] {2, "b"})));
         context.scheduledExecutorService.triggerAllNonPeriodicTasks();
-        return context.testKvSnapshotStore.waitUntilSnapshotComplete(TABLE_BUCKET, 0);
+        return replica;
     }
 
-    private Replica makeFreshLeader(RemoteRestoreSnapshotContext freshContext) throws Exception {
+    private Replica makeFreshLeader(SnapshotContext freshContext) throws Exception {
         Replica restored = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET, freshContext);
         makeKvReplicaAsLeader(restored, INITIAL_LEADER_EPOCH + 1);
         return restored;
@@ -243,6 +370,105 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         assertThat(values.get(0)).isNull();
     }
 
+    private final List<ExecutorService> testExecutors = new ArrayList<>();
+    private final List<KvSnapshotResource> testResources = new ArrayList<>();
+
+    @AfterEach
+    void tearDownRestoreFixtures() {
+        for (KvSnapshotResource resource : testResources) {
+            resource.close();
+        }
+        testResources.clear();
+        for (ExecutorService executor : testExecutors) {
+            executor.shutdownNow();
+        }
+        testExecutors.clear();
+    }
+
+    /**
+     * The production remote kv dir derived from the test configuration, so that snapshots written
+     * by a {@link TestSnapshotContext} land exactly where {@link DefaultSnapshotContext} lists
+     * them.
+     */
+    private String productionRemoteKvDir() {
+        String dir = FlussPaths.remoteKvDir(conf).toString();
+        new File(dir).mkdirs();
+        return dir;
+    }
+
+    private DefaultSnapshotContext newDefaultSnapshotContext(
+            @Nullable TestCoordinatorGateway gateway) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        testExecutors.add(executor);
+        KvSnapshotResource resource = KvSnapshotResource.create(TABLET_SERVER_ID, conf, executor);
+        testResources.add(resource);
+        return DefaultSnapshotContext.create(
+                zkClient, new TestingCompletedKvSnapshotCommitter(), resource, conf, gateway);
+    }
+
+    private KvSnapshotLeaseManager newCoordinatorLeaseManager() {
+        return new KvSnapshotLeaseManager(
+                Duration.ofDays(7).toMillis(),
+                zkClient,
+                new File(tempDir, "lease-metadata").getAbsolutePath(),
+                new ManuallyTriggeredScheduledExecutorService(),
+                new ManualClock(System.currentTimeMillis()),
+                TestingMetricGroups.COORDINATOR_METRICS);
+    }
+
+    /**
+     * A {@link TestCoordinatorGateway} serving lease RPCs with a real coordinator-side {@link
+     * KvSnapshotLeaseManager}, emulating {@code CoordinatorService} through the same {@link
+     * ServerRpcMessageUtils} helpers. Seam-level tests use it to prove that leases acquired through
+     * the coordinator path are visible to the coordinator's in-memory manager.
+     */
+    private static class LeaseForwardingGateway extends TestCoordinatorGateway {
+        private final KvSnapshotLeaseManager leaseManager;
+        private String lastLeaseId;
+        private long lastLeaseDurationMs;
+
+        LeaseForwardingGateway(KvSnapshotLeaseManager leaseManager) {
+            this.leaseManager = leaseManager;
+        }
+
+        @Override
+        public CompletableFuture<AcquireKvSnapshotLeaseResponse> acquireKvSnapshotLease(
+                AcquireKvSnapshotLeaseRequest request) {
+            try {
+                lastLeaseId = request.getLeaseId();
+                lastLeaseDurationMs = request.getLeaseDurationMs();
+                Map<TableBucket, Long> unavailable =
+                        leaseManager.acquireLease(
+                                request.getLeaseId(),
+                                request.getLeaseDurationMs(),
+                                ServerRpcMessageUtils.getAcquireKvSnapshotLeaseData(request));
+                return CompletableFuture.completedFuture(
+                        ServerRpcMessageUtils.makeAcquireKvSnapshotLeaseResponse(unavailable));
+            } catch (Exception e) {
+                CompletableFuture<AcquireKvSnapshotLeaseResponse> future =
+                        new CompletableFuture<>();
+                future.completeExceptionally(e);
+                return future;
+            }
+        }
+
+        @Override
+        public CompletableFuture<ReleaseKvSnapshotLeaseResponse> releaseKvSnapshotLease(
+                ReleaseKvSnapshotLeaseRequest request) {
+            try {
+                leaseManager.release(
+                        request.getLeaseId(),
+                        ServerRpcMessageUtils.getReleaseKvSnapshotLeaseData(request));
+                return CompletableFuture.completedFuture(new ReleaseKvSnapshotLeaseResponse());
+            } catch (Exception e) {
+                CompletableFuture<ReleaseKvSnapshotLeaseResponse> future =
+                        new CompletableFuture<>();
+                future.completeExceptionally(e);
+                return future;
+            }
+        }
+    }
+
     /**
      * A {@link TestSnapshotContext} with a dedicated remote snapshot store plus lease/download
      * tracking. The inherited {@code testKvSnapshotStore} models the local snapshot view, while
@@ -268,7 +494,8 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         }
 
         @Override
-        public Optional<CompletedSnapshot> getLatestRemoteSnapshot(TableBucket tableBucket) {
+        public Optional<CompletedSnapshot> getLatestRemoteSnapshot(
+                PhysicalTablePath physicalPath, TableBucket tableBucket) {
             return Optional.ofNullable(remoteSnapshotStore.getLatestCompletedSnapshot(tableBucket));
         }
 
