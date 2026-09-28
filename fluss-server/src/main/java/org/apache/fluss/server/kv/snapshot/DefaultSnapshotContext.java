@@ -21,8 +21,16 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ConfigException;
+import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseHandler;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseMetadataManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.utils.FlussPaths;
@@ -31,9 +39,19 @@ import org.apache.fluss.utils.function.FunctionWithException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
+
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getUnavailableSnapshots;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeAcquireKvSnapshotLeaseRequest;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeReleaseKvSnapshotLeaseRequest;
 
 /** A default implementation for {@link SnapshotContext}. */
 public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigurable {
@@ -55,6 +73,18 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
 
     private final CompletedSnapshotHandleStore completedSnapshotHandleStore;
 
+    private final KvSnapshotLeaseMetadataManager leaseMetadataManager;
+
+    /**
+     * The tablet-to-coordinator channel used to acquire snapshot leases through the coordinator so
+     * that the coordinator's in-memory lease manager protects the snapshot. Null when no
+     * coordinator channel is reachable from this context; lease acquisition then falls back to
+     * direct ZK writes (see {@link #acquireRemoteSnapshotLease}).
+     */
+    @Nullable private final CoordinatorGateway coordinatorGateway;
+
+    private final boolean restoreFromRemoteSnapshotEnabled;
+
     private final int maxFetchLogSizeInRecoverKv;
 
     private final int remoteLogPrefetchNumInRecoverKv;
@@ -74,6 +104,9 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             int writeBufferSizeInBytes,
             FsPath remoteKvDir,
             CompletedSnapshotHandleStore completedSnapshotHandleStore,
+            KvSnapshotLeaseMetadataManager leaseMetadataManager,
+            @Nullable CoordinatorGateway coordinatorGateway,
+            boolean restoreFromRemoteSnapshotEnabled,
             int maxFetchLogSizeInRecoverKv,
             int remoteLogPrefetchNumInRecoverKv,
             int remoteLogDownloadThreadsInRecoverKv) {
@@ -88,6 +121,9 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
         this.remoteKvDir = remoteKvDir;
 
         this.completedSnapshotHandleStore = completedSnapshotHandleStore;
+        this.leaseMetadataManager = leaseMetadataManager;
+        this.coordinatorGateway = coordinatorGateway;
+        this.restoreFromRemoteSnapshotEnabled = restoreFromRemoteSnapshotEnabled;
         this.maxFetchLogSizeInRecoverKv = maxFetchLogSizeInRecoverKv;
         this.remoteLogPrefetchNumInRecoverKv = remoteLogPrefetchNumInRecoverKv;
         this.remoteLogDownloadThreadsInRecoverKv = remoteLogDownloadThreadsInRecoverKv;
@@ -97,7 +133,8 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             ZooKeeperClient zkClient,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
             KvSnapshotResource kvSnapshotResource,
-            Configuration conf) {
+            Configuration conf,
+            @Nullable CoordinatorGateway coordinatorGateway) {
         return new DefaultSnapshotContext(
                 zkClient,
                 completedKvSnapshotCommitter,
@@ -109,6 +146,10 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
                 (int) conf.get(ConfigOptions.REMOTE_FS_WRITE_BUFFER_SIZE).getBytes(),
                 FlussPaths.remoteKvDir(conf),
                 new ZooKeeperCompletedSnapshotHandleStore(zkClient),
+                new KvSnapshotLeaseMetadataManager(
+                        zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR)),
+                coordinatorGateway,
+                conf.get(ConfigOptions.KV_RESTORE_FROM_REMOTE_SNAPSHOT_ENABLED),
                 (int) conf.get(ConfigOptions.KV_RECOVER_LOG_RECORD_BATCH_MAX_SIZE).getBytes(),
                 conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_PREFETCH_NUM),
                 conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_DOWNLOAD_THREADS));
@@ -165,6 +206,215 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             } else {
                 return null;
             }
+        };
+    }
+
+    @Override
+    public boolean isRemoteSnapshotRestoreEnabled() {
+        return restoreFromRemoteSnapshotEnabled;
+    }
+
+    @Override
+    public Optional<CompletedSnapshot> getLatestRemoteSnapshot(
+            PhysicalTablePath physicalPath, TableBucket tableBucket) throws Exception {
+        List<CompletedSnapshotHandle> handles =
+                completedSnapshotHandleStore.getAllCompletedSnapshotHandles(tableBucket);
+        CompletedSnapshot latest = null;
+        for (CompletedSnapshotHandle handle : handles) {
+            CompletedSnapshot snapshot;
+            try {
+                snapshot = handle.retrieveCompleteSnapshot();
+            } catch (Exception e) {
+                LOG.warn(
+                        "Failed to retrieve remote snapshot metadata {} for bucket {}, skipping it.",
+                        handle,
+                        tableBucket,
+                        e);
+                continue;
+            }
+            if (latest == null || snapshot.getSnapshotID() > latest.getSnapshotID()) {
+                latest = snapshot;
+            }
+        }
+        if (latest != null) {
+            return Optional.of(latest);
+        }
+        // The ZK handle store can be empty while snapshot files still exist in remote storage
+        // (e.g. ZK data loss, or handles cleaned while files remain). Fall back to listing the
+        // bucket's remote snapshot directory before giving up.
+        return findLatestSnapshotInRemoteStorage(physicalPath, tableBucket);
+    }
+
+    /**
+     * List the bucket's remote snapshot directory ({@code snap-<snapshotId>} subdirectories) and
+     * return the snapshot with the highest id. Each candidate's {@code _METADATA} file is parsed
+     * with the same serde the download path uses ({@link CompletedSnapshotHandle}, i.e. {@link
+     * CompletedSnapshotJsonSerde}); entries that cannot be listed or parsed — including partially
+     * uploaded snapshots without metadata yet — are skipped with a warning. An empty result keeps
+     * the caller's healthy-empty behavior untouched.
+     *
+     * <p>Note: object stores apply their own pagination to listings internally; the filesystem
+     * abstraction surfaces the full listing, so no explicit pagination handling is needed here.
+     * Listings may be eventually consistent, so a very recently uploaded snapshot can be missed —
+     * the next replica init retry will pick it up.
+     *
+     * @param physicalPath the physical path of the table, locating the bucket in remote storage
+     * @param tableBucket the table bucket to discover the remote snapshot for
+     * @return the latest snapshot found in remote storage, or {@link Optional#empty()} when the
+     *     directory holds no readable snapshot
+     * @throws Exception if the remote directory itself cannot be accessed
+     */
+    private Optional<CompletedSnapshot> findLatestSnapshotInRemoteStorage(
+            PhysicalTablePath physicalPath, TableBucket tableBucket) throws Exception {
+        FsPath remoteTabletDir =
+                FlussPaths.remoteKvTabletDir(remoteKvDir, physicalPath, tableBucket);
+        if (!remoteTabletDir.getFileSystem().exists(remoteTabletDir)) {
+            return Optional.empty();
+        }
+        FileStatus[] statuses = remoteTabletDir.getFileSystem().listStatus(remoteTabletDir);
+        CompletedSnapshot latest = null;
+        if (statuses != null) {
+            for (FileStatus status : statuses) {
+                if (!status.isDir()) {
+                    continue;
+                }
+                String dirName = status.getPath().getName();
+                if (!dirName.startsWith(FlussPaths.REMOTE_KV_SNAPSHOT_DIR_PREFIX)) {
+                    continue;
+                }
+                CompletedSnapshot snapshot;
+                try {
+                    FsPath metadataPath = CompletedSnapshot.getMetadataFilePath(status.getPath());
+                    // The handle only carries the metadata path here; snapshot id and log offset
+                    // are re-read from the file by the existing serde.
+                    snapshot =
+                            new CompletedSnapshotHandle(0L, metadataPath, 0L)
+                                    .retrieveCompleteSnapshot();
+                } catch (Exception e) {
+                    LOG.warn(
+                            "Failed to read remote snapshot metadata in {} for bucket {}, skipping it.",
+                            status.getPath(),
+                            tableBucket,
+                            e);
+                    continue;
+                }
+                if (!tableBucket.equals(snapshot.getTableBucket())) {
+                    LOG.warn(
+                            "Remote snapshot {} in {} belongs to unexpected bucket {}, skipping it.",
+                            snapshot.getSnapshotID(),
+                            status.getPath(),
+                            snapshot.getTableBucket());
+                    continue;
+                }
+                if (latest == null || snapshot.getSnapshotID() > latest.getSnapshotID()) {
+                    latest = snapshot;
+                }
+            }
+        }
+        return Optional.ofNullable(latest);
+    }
+
+    @Override
+    public RemoteSnapshotLease acquireRemoteSnapshotLease(
+            TableBucket tableBucket, long snapshotId, long leaseDurationMs) throws Exception {
+        String leaseId = "restore-" + UUID.randomUUID();
+        if (coordinatorGateway != null) {
+            return acquireRemoteSnapshotLeaseViaCoordinator(
+                    leaseId, tableBucket, snapshotId, leaseDurationMs);
+        }
+        // No tablet-to-coordinator channel is reachable from this context (e.g. standalone or
+        // test usage without a coordinator gateway). Fall back to writing the lease record
+        // straight to ZK. Note this bypasses the live coordinator's in-memory lease manager, so
+        // retention protection against a RUNNING coordinator is not guaranteed on this path;
+        // prefer the coordinator RPC path whenever a gateway is available.
+        return acquireRemoteSnapshotLeaseViaZk(leaseId, tableBucket, snapshotId, leaseDurationMs);
+    }
+
+    /**
+     * Acquire the lease through the coordinator RPC path so that the coordinator's in-memory {@code
+     * KvSnapshotLeaseManager} sees it and protects the snapshot from retention cleanup. This is the
+     * tablet-to-coordinator channel reachable from replica init: the tablet server already talks to
+     * the coordinator through {@link CoordinatorGateway} (as for ISR adjusts and remote-log
+     * manifest commits, including blocking calls), and the request is served by {@code
+     * CoordinatorService#acquireKvSnapshotLease}.
+     *
+     * @param leaseId the generated lease id, unique per restore
+     * @param tableBucket the table bucket the snapshot belongs to
+     * @param snapshotId the id of the snapshot to pin
+     * @param leaseDurationMs the lease duration in milliseconds
+     * @return the acquired lease; closing it releases the lease through the coordinator
+     * @throws Exception if acquiring the lease failed
+     */
+    private RemoteSnapshotLease acquireRemoteSnapshotLeaseViaCoordinator(
+            final String leaseId,
+            final TableBucket tableBucket,
+            final long snapshotId,
+            final long leaseDurationMs)
+            throws Exception {
+        AcquireKvSnapshotLeaseRequest request =
+                makeAcquireKvSnapshotLeaseRequest(
+                        leaseId, tableBucket, snapshotId, leaseDurationMs);
+        AcquireKvSnapshotLeaseResponse response =
+                coordinatorGateway.acquireKvSnapshotLease(request).get();
+        Map<TableBucket, Long> unavailableSnapshots = getUnavailableSnapshots(response);
+        if (!unavailableSnapshots.isEmpty()) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Failed to acquire remote snapshot lease %s for snapshot %d of bucket %s, "
+                                    + "unavailable snapshots: %s.",
+                            leaseId, snapshotId, tableBucket, unavailableSnapshots));
+        }
+        LOG.info(
+                "Acquired remote snapshot lease {} for snapshot {} of bucket {} via coordinator.",
+                leaseId,
+                snapshotId,
+                tableBucket);
+        return () -> {
+            ReleaseKvSnapshotLeaseRequest releaseRequest =
+                    makeReleaseKvSnapshotLeaseRequest(
+                            leaseId, Collections.singletonList(tableBucket));
+            coordinatorGateway.releaseKvSnapshotLease(releaseRequest).get();
+            LOG.info(
+                    "Released remote snapshot lease {} for snapshot {} of bucket {} via coordinator.",
+                    leaseId,
+                    snapshotId,
+                    tableBucket);
+        };
+    }
+
+    /**
+     * Write the lease record straight to ZK. See {@link #acquireRemoteSnapshotLease} for why this
+     * is only a fallback when no coordinator gateway is available.
+     *
+     * @param leaseId the generated lease id, unique per restore
+     * @param tableBucket the table bucket the snapshot belongs to
+     * @param snapshotId the id of the snapshot to pin
+     * @param leaseDurationMs the lease duration in milliseconds
+     * @return the acquired lease; closing it deletes the ZK lease record
+     * @throws Exception if acquiring the lease failed
+     */
+    private RemoteSnapshotLease acquireRemoteSnapshotLeaseViaZk(
+            final String leaseId,
+            final TableBucket tableBucket,
+            final long snapshotId,
+            final long leaseDurationMs)
+            throws Exception {
+        long expirationTime = System.currentTimeMillis() + leaseDurationMs;
+        KvSnapshotLeaseHandler leaseHandler = new KvSnapshotLeaseHandler(expirationTime);
+        leaseHandler.acquireBucket(tableBucket, snapshotId, tableBucket.getBucket() + 1);
+        leaseMetadataManager.registerLease(leaseId, leaseHandler);
+        LOG.info(
+                "Acquired remote snapshot lease {} for snapshot {} of bucket {} via ZK.",
+                leaseId,
+                snapshotId,
+                tableBucket);
+        return () -> {
+            leaseMetadataManager.deleteLease(leaseId);
+            LOG.info(
+                    "Released remote snapshot lease {} for snapshot {} of bucket {} via ZK.",
+                    leaseId,
+                    snapshotId,
+                    tableBucket);
         };
     }
 

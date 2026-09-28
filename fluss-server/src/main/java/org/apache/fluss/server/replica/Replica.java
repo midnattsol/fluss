@@ -78,6 +78,7 @@ import org.apache.fluss.server.kv.snapshot.KvSnapshotDownloadSpec;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.KvTabletSnapshotTarget;
 import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
+import org.apache.fluss.server.kv.snapshot.RemoteSnapshotLease;
 import org.apache.fluss.server.kv.snapshot.RocksIncrementalSnapshot;
 import org.apache.fluss.server.kv.snapshot.SnapshotContext;
 import org.apache.fluss.server.log.FetchDataInfo;
@@ -139,6 +140,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -209,6 +211,13 @@ public final class Replica {
     private final RemoteLogManager remoteLogManager;
 
     private static final int INIT_KV_TABLET_MAX_RETRY_TIMES = 5;
+    /**
+     * How long a remote snapshot lease acquired for a total-loss/fast-bootstrap restore stays
+     * valid. The lease only guards the download; it is always released right after the restore, so
+     * this duration is just a safety net for crashes mid-download.
+     */
+    private static final long REMOTE_RESTORE_SNAPSHOT_LEASE_DURATION_MS =
+            TimeUnit.MINUTES.toMillis(30);
     /**
      * storing the remote follower replicas' state, used to update leader's highWatermark and
      * replica ISR.
@@ -853,7 +862,7 @@ public final class Replica {
      *
      * @return the snapshot used to init kv tablet, empty if no any snapshot.
      */
-    private Optional<CompletedSnapshot> initKvTablet() {
+    private Optional<CompletedSnapshot> initKvTablet() throws Exception {
         checkNotNull(kvManager);
         TableConfig tableConfig = getTableConfig();
         long startTime = clock.milliseconds();
@@ -861,7 +870,8 @@ public final class Replica {
 
         // todo: we may need to handle the following cases:
         // case1: no kv files in local, restore from remote snapshot; and apply
-        // the log;
+        // the log; -> handled below via tryGetLatestRemoteSnapshot (total-loss
+        // recovery and fast bootstrap of new/empty replicas share this path).
         // case2: kv files in local
         //       - if no remote snapshot, restore from local and apply the log known to the local
         // files.
@@ -879,6 +889,28 @@ public final class Replica {
         // never restore a normal KV snapshot, even if one exists from older code.
         Optional<CompletedSnapshot> optCompletedSnapshot =
                 isHistoricalPartition() ? Optional.empty() : getLatestSnapshot(tableBucket);
+        // When no local snapshot exists and no local kv state survived, fall back to the latest
+        // remote snapshot (if any) instead of restoring from the log only. The remote snapshot is
+        // pinned by a lease for the whole init so that it cannot be deleted while downloading.
+        // The restore below then proceeds exactly like the local-snapshot path.
+        RemoteSnapshotLease remoteSnapshotLease = null;
+        if (!optCompletedSnapshot.isPresent()) {
+            Optional<CompletedSnapshot> remoteSnapshot = tryGetLatestRemoteSnapshot();
+            if (remoteSnapshot.isPresent()) {
+                CompletedSnapshot completedSnapshot = remoteSnapshot.get();
+                LOG.info(
+                        "No local snapshot found for {} of {}, will restore from remote snapshot {}.",
+                        tableBucket,
+                        physicalPath,
+                        completedSnapshot);
+                remoteSnapshotLease =
+                        snapshotContext.acquireRemoteSnapshotLease(
+                                tableBucket,
+                                completedSnapshot.getSnapshotID(),
+                                REMOTE_RESTORE_SNAPSHOT_LEASE_DURATION_MS);
+                optCompletedSnapshot = remoteSnapshot;
+            }
+        }
         try {
             Long rowCount;
             AutoIncIDRange autoIncIDRange;
@@ -946,6 +978,18 @@ public final class Replica {
                             "Fail to init kv tablet for %s of table %s.",
                             tableBucket, physicalPath),
                     e);
+        } finally {
+            if (remoteSnapshotLease != null) {
+                try {
+                    remoteSnapshotLease.close();
+                } catch (Exception e) {
+                    LOG.warn(
+                            "Failed to release remote snapshot lease for {} of table {}.",
+                            tableBucket,
+                            physicalPath,
+                            e);
+                }
+            }
         }
         long endTime = clock.milliseconds();
         LOG.info(
@@ -1025,6 +1069,43 @@ public final class Replica {
                     e);
         }
         return Optional.empty();
+    }
+
+    /**
+     * Discover the latest remote snapshot for restoring an empty replica (total-loss recovery and
+     * fast bootstrap of new/empty replicas share this path).
+     *
+     * <p>Returns empty — keeping the current restore-from-log behavior — for historical replicas,
+     * when restoring from remote snapshots is disabled, when local kv state survived (it must never
+     * be overwritten by a remote download), or when no remote snapshot can be discovered.
+     */
+    private Optional<CompletedSnapshot> tryGetLatestRemoteSnapshot() {
+        if (isHistoricalPartition()
+                || !snapshotContext.isRemoteSnapshotRestoreEnabled()
+                || hasLocalKvState()) {
+            return Optional.empty();
+        }
+        try {
+            return snapshotContext.getLatestRemoteSnapshot(physicalPath, tableBucket);
+        } catch (Exception e) {
+            LOG.warn(
+                    "Get latest remote snapshot for {} of table {} failed, will restore from log.",
+                    tableBucket,
+                    physicalPath,
+                    e);
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Whether the local kv tablet dir already holds kv state. A remote snapshot must only be
+     * downloaded when no local state exists, since downloading recreates the tablet dir from
+     * scratch.
+     */
+    private boolean hasLocalKvState() {
+        File tabletDir = FlussPaths.kvTabletDir(logTablet.getDataDir(), physicalPath, tableBucket);
+        String[] files = tabletDir.list();
+        return files != null && files.length > 0;
     }
 
     private void recoverKvTablet(

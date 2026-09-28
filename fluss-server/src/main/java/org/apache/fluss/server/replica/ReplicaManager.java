@@ -358,7 +358,11 @@ public class ReplicaManager implements ServerReconfigurable {
         this.kvSnapshotResource = KvSnapshotResource.create(serverId, conf, ioExecutor);
         this.kvSnapshotContext =
                 DefaultSnapshotContext.create(
-                        zkClient, completedKvSnapshotCommitter, kvSnapshotResource, conf);
+                        zkClient,
+                        completedKvSnapshotCommitter,
+                        kvSnapshotResource,
+                        conf,
+                        coordinatorGateway);
         this.remoteLogManager = remoteLogManager;
         this.serverMetricGroup = serverMetricGroup;
         this.userMetrics = userMetrics;
