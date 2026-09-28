@@ -17,6 +17,14 @@ on:
         description: 'Image tag suffix to publish (e.g. 1.0.0-midnattsol.9-dryrun)'
         required: true
         default: '1.0.0-midnattsol.0-dryrun'
+      images:
+        description: 'Which images to publish'
+        type: choice
+        options:
+          - all
+          - server
+          - gateway
+        default: all
 
 permissions:
   contents: read
@@ -24,6 +32,9 @@ permissions:
 
 jobs:
   server-image:
+    # Tag pushes always publish both images in lockstep; manual runs may
+    # select one (inputs only exist on workflow_dispatch).
+    if: github.event_name == 'push' || inputs.images == 'all' || inputs.images == 'server'
     runs-on: ubuntu-latest
     steps:
       - name: Check out fork develop
@@ -74,6 +85,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/midnattsol/fluss
 
   gateway-image:
+    if: github.event_name == 'push' || inputs.images == 'all' || inputs.images == 'gateway'
     runs-on: ubuntu-latest
     steps:
       - name: Check out fork develop
