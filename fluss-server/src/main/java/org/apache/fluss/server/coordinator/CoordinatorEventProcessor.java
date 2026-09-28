@@ -199,6 +199,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
     private final RebalanceManager rebalanceManager;
     private final Scheduler scheduler;
     private final long offlineLeaderRetryDelayMs;
+    private final long notifyLeaderAndIsrRetryDelayMs;
     private final CompletedSnapshotStoreManager completedSnapshotStoreManager;
     private final LakeTableHelper lakeTableHelper;
     private ScheduledFuture<?> offlineLeaderRetryTask;
@@ -224,13 +225,24 @@ public class CoordinatorEventProcessor implements EventProcessor {
         this.coordinatorContext = coordinatorContext;
         this.replicaCapacityController = replicaCapacityController;
         this.coordinatorEventManager = new CoordinatorEventManager(this, coordinatorMetricGroup);
+        this.notifyLeaderAndIsrRetryDelayMs =
+                conf.get(ConfigOptions.COORDINATOR_NOTIFY_LEADER_AND_ISR_RETRY_DELAY).toMillis();
+        if (notifyLeaderAndIsrRetryDelayMs <= 0) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "%s must be positive, but was %d ms.",
+                            ConfigOptions.COORDINATOR_NOTIFY_LEADER_AND_ISR_RETRY_DELAY.key(),
+                            notifyLeaderAndIsrRetryDelayMs));
+        }
         this.replicaStateMachine =
                 new ReplicaStateMachine(
                         coordinatorContext,
                         new CoordinatorRequestBatch(
                                 coordinatorChannelManager,
                                 coordinatorEventManager,
-                                coordinatorContext),
+                                coordinatorContext,
+                                scheduler,
+                                notifyLeaderAndIsrRetryDelayMs),
                         zooKeeperClient);
         this.tableBucketStateMachine =
                 new TableBucketStateMachine(
@@ -238,7 +250,9 @@ public class CoordinatorEventProcessor implements EventProcessor {
                         new CoordinatorRequestBatch(
                                 coordinatorChannelManager,
                                 coordinatorEventManager,
-                                coordinatorContext),
+                                coordinatorContext,
+                                scheduler,
+                                notifyLeaderAndIsrRetryDelayMs),
                         zooKeeperClient);
         this.metadataManager = metadataManager;
 
@@ -262,7 +276,11 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 new TabletServerChangeWatcher(zooKeeperClient, coordinatorEventManager);
         this.coordinatorRequestBatch =
                 new CoordinatorRequestBatch(
-                        coordinatorChannelManager, coordinatorEventManager, coordinatorContext);
+                        coordinatorChannelManager,
+                        coordinatorEventManager,
+                        coordinatorContext,
+                        scheduler,
+                        notifyLeaderAndIsrRetryDelayMs);
 
         this.completedSnapshotStoreManager =
                 new CompletedSnapshotStoreManager(
@@ -1336,15 +1354,13 @@ public class CoordinatorEventProcessor implements EventProcessor {
         // when we finish the logic of tablet server
         ServerInfo serverInfo = newTabletServerEvent.getServerInfo();
         int tabletServerId = serverInfo.id();
-        if (coordinatorContext.getLiveTabletServers().containsKey(serverInfo.id())) {
-            // if the dead server is already in live servers, return directly
-            // it may happen during coordinator server initiation, the watcher watch a new tablet
-            // server register event and put it to event manager, but after that, the coordinator
-            // server read
-            // all tablet server nodes registered which contain the tablet server; in this case,
-            // we can ignore it.
-            return;
-        }
+        // Fall through even if the server is already listed as live. A fast pod restart can
+        // re-register while its previous ZooKeeper node has not expired yet, and the tablet
+        // server still needs reconciliation below: without it, a follower that missed its
+        // notify-leader-and-isr would never get a fetcher and stay out of the ISR. All steps
+        // that follow (live-server map update, channel state, metadata caches, and
+        // replica/bucket state transitions) are idempotent, so re-running them for an already
+        // known server is safe, including the duplicate delivery during coordinator startup.
 
         // process new tablet server
         LOG.info("New tablet server callback for tablet server {}", tabletServerId);

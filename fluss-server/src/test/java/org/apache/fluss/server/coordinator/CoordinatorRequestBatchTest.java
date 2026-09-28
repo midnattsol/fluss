@@ -29,21 +29,30 @@ import org.apache.fluss.server.coordinator.event.AccessContextEvent;
 import org.apache.fluss.server.coordinator.event.EventManager;
 import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.testutils.common.ScheduledTask;
+import org.apache.fluss.utils.concurrent.Scheduler;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
 import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTableBucket;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for the {@link CoordinatorRequestBatch}. */
 class CoordinatorRequestBatchTest {
+
+    private static final long RETRY_DELAY_MS = 30_000L;
 
     private CoordinatorContext coordinatorContext;
 
@@ -76,7 +85,12 @@ class CoordinatorRequestBatchTest {
         EventManager eventManager = newSynchronousAccessContextEventManager();
 
         CoordinatorRequestBatch batch =
-                new CoordinatorRequestBatch(failingChannel, eventManager, coordinatorContext);
+                new CoordinatorRequestBatch(
+                        failingChannel,
+                        eventManager,
+                        coordinatorContext,
+                        new ManualScheduler(),
+                        RETRY_DELAY_MS);
         // server 0 IS the leader, so this request will mark tb pending.
         batch.addNotifyLeaderRequestForTabletServers(
                 Collections.singleton(0),
@@ -121,7 +135,12 @@ class CoordinatorRequestBatchTest {
         EventManager eventManager = newSynchronousAccessContextEventManager();
 
         CoordinatorRequestBatch batch =
-                new CoordinatorRequestBatch(failingChannel, eventManager, coordinatorContext);
+                new CoordinatorRequestBatch(
+                        failingChannel,
+                        eventManager,
+                        coordinatorContext,
+                        new ManualScheduler(),
+                        RETRY_DELAY_MS);
         // Send to server 1, which is a follower for followerTb (leader is 0). Because
         // leader != serverId, this request does NOT add followerTb to pending, so the failure
         // callback must short-circuit without dispatching an AccessContextEvent.
@@ -169,7 +188,9 @@ class CoordinatorRequestBatchTest {
                 new CoordinatorRequestBatch(
                         channelManager,
                         newSynchronousAccessContextEventManager(),
-                        coordinatorContext);
+                        coordinatorContext,
+                        new ManualScheduler(),
+                        RETRY_DELAY_MS);
 
         batch.addNotifyLeaderRequestForTabletServers(
                 Collections.singleton(0),
@@ -188,6 +209,138 @@ class CoordinatorRequestBatchTest {
         assertThat(bucketRequest.hasBucketCount()).isFalse();
         assertThat(bucketRequest.hasBucketCountEpoch()).isFalse();
         assertThat(coordinatorContext.getPendingLeaderActivationBuckets()).isEmpty();
+    }
+
+    /**
+     * A failed notify-leader-and-isr send to a live server must schedule a one-shot retry, and
+     * pumping the scheduler must resend the same buckets.
+     */
+    @Test
+    void testNotifyLeaderAndIsrFailureSchedulesRetryWithSameBuckets() {
+        long tableId = 400L;
+        TableBucket tb = new TableBucket(tableId, 0);
+        TablePath tablePath = TablePath.of("db1", "t4");
+
+        coordinatorContext.putTablePath(tableId, tablePath);
+        putTableInfo(tableId, tablePath);
+        coordinatorContext.setLiveTabletServers(
+                CoordinatorTestUtils.createServers(Collections.singletonList(0)));
+        coordinatorContext.updateBucketReplicaAssignment(tb, Collections.singletonList(0));
+        LeaderAndIsr leaderAndIsr =
+                new LeaderAndIsr(0, 0, Collections.singletonList(0), Collections.emptyList(), 0, 0);
+        coordinatorContext.putBucketLeaderAndIsr(tb, leaderAndIsr);
+
+        AtomicInteger sendCount = new AtomicInteger();
+        List<NotifyLeaderAndIsrRequest> sentRequests = new ArrayList<>();
+        TestCoordinatorChannelManager flakyChannel =
+                new TestCoordinatorChannelManager() {
+                    @Override
+                    public void sendBucketLeaderAndIsrRequest(
+                            int receiveServerId,
+                            NotifyLeaderAndIsrRequest notifyLeaderAndIsrRequest,
+                            BiConsumer<NotifyLeaderAndIsrResponse, ? super Throwable>
+                                    responseConsumer) {
+                        sentRequests.add(notifyLeaderAndIsrRequest);
+                        if (sendCount.getAndIncrement() == 0) {
+                            responseConsumer.accept(
+                                    null, new NetworkException("simulated send failure for test"));
+                        } else {
+                            responseConsumer.accept(new NotifyLeaderAndIsrResponse(), null);
+                        }
+                    }
+                };
+        ManualScheduler scheduler = new ManualScheduler();
+        CoordinatorRequestBatch batch =
+                new CoordinatorRequestBatch(
+                        flakyChannel,
+                        newSynchronousAccessContextEventManager(),
+                        coordinatorContext,
+                        scheduler,
+                        RETRY_DELAY_MS);
+        batch.addNotifyLeaderRequestForTabletServers(
+                Collections.singleton(0),
+                PhysicalTablePath.of(tablePath),
+                tb,
+                Collections.singletonList(0),
+                leaderAndIsr);
+
+        batch.sendRequestToTabletServers(0);
+
+        assertThat(sendCount.get()).isEqualTo(1);
+        assertThat(scheduler.pendingTaskCount()).isEqualTo(1);
+
+        scheduler.runPendingTasks();
+
+        // The retry resends the same buckets and succeeds, so no further retry is scheduled.
+        assertThat(sendCount.get()).isEqualTo(2);
+        assertThat(scheduler.pendingTaskCount()).isEqualTo(0);
+        assertThat(sentRequests).hasSize(2);
+        for (NotifyLeaderAndIsrRequest sentRequest : sentRequests) {
+            assertThat(sentRequest.getNotifyBucketsLeaderReqsList()).hasSize(1);
+            assertThat(
+                            toTableBucket(
+                                    sentRequest
+                                            .getNotifyBucketsLeaderReqsList()
+                                            .get(0)
+                                            .getTableBucket()))
+                    .isEqualTo(tb);
+        }
+    }
+
+    /**
+     * A failed notify-leader-and-isr send to a server that is no longer live must not schedule a
+     * retry; recovery for dead servers is owned by the dead-server path.
+     */
+    @Test
+    void testNotifyLeaderAndIsrFailureToDeadServerSchedulesNoRetry() {
+        long tableId = 500L;
+        TableBucket tb = new TableBucket(tableId, 0);
+        TablePath tablePath = TablePath.of("db1", "t5");
+
+        coordinatorContext.putTablePath(tableId, tablePath);
+        putTableInfo(tableId, tablePath);
+        // Server 0 is deliberately NOT registered as live.
+        coordinatorContext.updateBucketReplicaAssignment(tb, Collections.singletonList(0));
+        LeaderAndIsr leaderAndIsr =
+                new LeaderAndIsr(0, 0, Collections.singletonList(0), Collections.emptyList(), 0, 0);
+        coordinatorContext.putBucketLeaderAndIsr(tb, leaderAndIsr);
+
+        AtomicInteger sendCount = new AtomicInteger();
+        TestCoordinatorChannelManager failingChannel =
+                new TestCoordinatorChannelManager() {
+                    @Override
+                    public void sendBucketLeaderAndIsrRequest(
+                            int receiveServerId,
+                            NotifyLeaderAndIsrRequest notifyLeaderAndIsrRequest,
+                            BiConsumer<NotifyLeaderAndIsrResponse, ? super Throwable>
+                                    responseConsumer) {
+                        sendCount.incrementAndGet();
+                        responseConsumer.accept(
+                                null, new NetworkException("simulated send failure for test"));
+                    }
+                };
+        ManualScheduler scheduler = new ManualScheduler();
+        CoordinatorRequestBatch batch =
+                new CoordinatorRequestBatch(
+                        failingChannel,
+                        newSynchronousAccessContextEventManager(),
+                        coordinatorContext,
+                        scheduler,
+                        RETRY_DELAY_MS);
+        batch.addNotifyLeaderRequestForTabletServers(
+                Collections.singleton(0),
+                PhysicalTablePath.of(tablePath),
+                tb,
+                Collections.singletonList(0),
+                leaderAndIsr);
+
+        batch.sendRequestToTabletServers(0);
+
+        assertThat(sendCount.get()).isEqualTo(1);
+        assertThat(scheduler.pendingTaskCount()).isEqualTo(0);
+
+        scheduler.runPendingTasks();
+        assertThat(sendCount.get()).isEqualTo(1);
     }
 
     /** Registers table metadata so normal notifications carry the bucket layout epoch. */
@@ -227,5 +380,43 @@ class CoordinatorRequestBatchTest {
                 accessContextEvent.getAccessFunction().apply(coordinatorContext);
             }
         };
+    }
+
+    /**
+     * A scheduler that queues tasks instead of running them, so tests pump retries by hand. Never
+     * combine with an always-failing channel and pump it: the self-rearming retry would resend
+     * forever.
+     */
+    private static final class ManualScheduler implements Scheduler {
+        private final List<Runnable> pendingTasks = new ArrayList<>();
+
+        @Override
+        public void startup() {
+            // do nothing
+        }
+
+        @Override
+        public void shutdown() {
+            // do nothing
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(
+                String name, Runnable task, long delayMs, long periodMs) {
+            pendingTasks.add(task);
+            return new ScheduledTask<>(() -> null, delayMs, periodMs);
+        }
+
+        private int pendingTaskCount() {
+            return pendingTasks.size();
+        }
+
+        private void runPendingTasks() {
+            List<Runnable> tasksToRun = new ArrayList<>(pendingTasks);
+            pendingTasks.clear();
+            for (Runnable task : tasksToRun) {
+                task.run();
+            }
+        }
     }
 }

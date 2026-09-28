@@ -251,6 +251,16 @@ public class ConfigOptions {
                                     + "conditions, such as disk write protection, become electable "
                                     + "again after recovery.");
 
+    public static final ConfigOption<Duration> COORDINATOR_NOTIFY_LEADER_AND_ISR_RETRY_DELAY =
+            key("coordinator.notify-leader-and-isr.retry-delay")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription(
+                            "The delay before the coordinator retries a failed "
+                                    + "notify-leader-and-isr request to a live tablet server. "
+                                    + "Without a retry, a dropped notification can leave assigned "
+                                    + "replicas out of the ISR indefinitely.");
+
     public static final ConfigOption<Boolean> LOG_TABLE_ALLOW_CREATION =
             key("allow.create.log.tables")
                     .booleanType()

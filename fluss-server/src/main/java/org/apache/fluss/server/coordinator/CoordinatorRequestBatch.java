@@ -46,6 +46,7 @@ import org.apache.fluss.server.metadata.PartitionMetadata;
 import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.utils.concurrent.Scheduler;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -114,14 +115,20 @@ public class CoordinatorRequestBatch {
     private final CoordinatorChannelManager coordinatorChannelManager;
     private final EventManager eventManager;
     private final CoordinatorContext coordinatorContext;
+    private final Scheduler scheduler;
+    private final long notifyLeaderAndIsrRetryDelayMs;
 
     public CoordinatorRequestBatch(
             CoordinatorChannelManager coordinatorChannelManager,
             EventManager eventManager,
-            CoordinatorContext coordinatorContext) {
+            CoordinatorContext coordinatorContext,
+            Scheduler scheduler,
+            long notifyLeaderAndIsrRetryDelayMs) {
         this.coordinatorChannelManager = coordinatorChannelManager;
         this.eventManager = eventManager;
         this.coordinatorContext = coordinatorContext;
+        this.scheduler = scheduler;
+        this.notifyLeaderAndIsrRetryDelayMs = notifyLeaderAndIsrRetryDelayMs;
     }
 
     public void newBatch() {
@@ -451,63 +458,141 @@ public class CoordinatorRequestBatch {
     private void sendNotifyLeaderAndIsrRequest(int coordinatorEpoch) {
         for (Map.Entry<Integer, Map<TableBucket, PbNotifyLeaderAndIsrReqForBucket>>
                 notifyRequestEntry : notifyLeaderAndIsrRequestMap.entrySet()) {
-            // send request for each tablet server
-            Integer serverId = notifyRequestEntry.getKey();
-            NotifyLeaderAndIsrRequest notifyLeaderAndIsrRequest =
-                    makeNotifyLeaderAndIsrRequest(
-                            coordinatorEpoch, notifyRequestEntry.getValue().values());
-
-            // Track exactly which buckets THIS request marked as pending leader activation. Only
-            // those entries (where leader == serverId) need to be cleared if the request fails
-            Set<TableBucket> addedToPendingLeaderActivation = new HashSet<>();
-            for (Map.Entry<TableBucket, PbNotifyLeaderAndIsrReqForBucket> entry :
-                    notifyRequestEntry.getValue().entrySet()) {
-                int leader = entry.getValue().getLeader();
-                if (leader == serverId) {
-                    coordinatorContext.addPendingLeaderActivation(entry.getKey());
-                    addedToPendingLeaderActivation.add(entry.getKey());
-                }
-            }
-
-            coordinatorChannelManager.sendBucketLeaderAndIsrRequest(
-                    serverId,
-                    notifyLeaderAndIsrRequest,
-                    (response, throwable) -> {
-                        if (throwable != null) {
-                            LOG.warn(
-                                    "Failed to send notify leader and isr request to tablet server {}.",
-                                    serverId,
-                                    throwable);
-                            // todo: in FLUSS-55886145, we will introduce a sender thread to send
-                            // the request, and retry if encounter any error; It may happens that
-                            // the tablet server is offline and will always got error. But,
-                            // coordinator will remove the sender for the tablet server and mark all
-                            // replica in the tablet server as offline. so, in here, if encounter
-                            // any error, we just ignore it.
-
-                            // Clear pending state so the health API does not report stale
-                            // RED. The coordinator will detect actual server death via
-                            // heartbeat timeout and trigger re-election separately.
-                            if (!addedToPendingLeaderActivation.isEmpty()) {
-                                eventManager.put(
-                                        new AccessContextEvent<Void>(
-                                                ctx -> {
-                                                    for (TableBucket tb :
-                                                            addedToPendingLeaderActivation) {
-                                                        ctx.clearPendingLeaderActivation(tb);
-                                                    }
-                                                    return null;
-                                                }));
-                            }
-                            return;
-                        }
-                        // put the response receive event into the event manager
-                        eventManager.put(
-                                new NotifyLeaderAndIsrResponseReceivedEvent(
-                                        getNotifyLeaderAndIsrResponseData(response), serverId));
-                    });
+            // send request for each tablet server; copy the buckets so a later scheduled
+            // retry resends exactly this snapshot
+            sendNotifyLeaderAndIsrToServer(
+                    coordinatorEpoch,
+                    notifyRequestEntry.getKey(),
+                    new HashMap<>(notifyRequestEntry.getValue()));
         }
         notifyLeaderAndIsrRequestMap.clear();
+    }
+
+    /**
+     * Sends a notify-leader-and-isr request to one tablet server. On transport failure the request
+     * is retried once after {@link #notifyLeaderAndIsrRetryDelayMs}; the retry reuses this same
+     * method, so failures keep re-arming until the server is dead or the send succeeds.
+     */
+    private void sendNotifyLeaderAndIsrToServer(
+            int coordinatorEpoch,
+            int serverId,
+            Map<TableBucket, PbNotifyLeaderAndIsrReqForBucket> bucketsForServer) {
+        NotifyLeaderAndIsrRequest notifyLeaderAndIsrRequest =
+                makeNotifyLeaderAndIsrRequest(coordinatorEpoch, bucketsForServer.values());
+
+        // Track exactly which buckets THIS request marked as pending leader activation. Only
+        // those entries (where leader == serverId) need to be cleared if the request fails
+        Set<TableBucket> addedToPendingLeaderActivation = new HashSet<>();
+        for (Map.Entry<TableBucket, PbNotifyLeaderAndIsrReqForBucket> entry :
+                bucketsForServer.entrySet()) {
+            int leader = entry.getValue().getLeader();
+            if (leader == serverId) {
+                coordinatorContext.addPendingLeaderActivation(entry.getKey());
+                addedToPendingLeaderActivation.add(entry.getKey());
+            }
+        }
+
+        coordinatorChannelManager.sendBucketLeaderAndIsrRequest(
+                serverId,
+                notifyLeaderAndIsrRequest,
+                (response, throwable) -> {
+                    if (throwable != null) {
+                        LOG.warn(
+                                "Failed to send notify leader and isr request to tablet server {}.",
+                                serverId,
+                                throwable);
+                        // todo: in FLUSS-55886145, we will introduce a sender thread to send
+                        // the request, and retry if encounter any error; It may happens that
+                        // the tablet server is offline and will always got error. But,
+                        // coordinator will remove the sender for the tablet server and mark all
+                        // replica in the tablet server as offline. so, in here, if encounter
+                        // any error, we just ignore it.
+
+                        // Clear pending state so the health API does not report stale
+                        // RED. The coordinator will detect actual server death via
+                        // heartbeat timeout and trigger re-election separately.
+                        if (!addedToPendingLeaderActivation.isEmpty()) {
+                            eventManager.put(
+                                    new AccessContextEvent<Void>(
+                                            ctx -> {
+                                                for (TableBucket tb :
+                                                        addedToPendingLeaderActivation) {
+                                                    ctx.clearPendingLeaderActivation(tb);
+                                                }
+                                                return null;
+                                            }));
+                        }
+                        scheduleNotifyLeaderAndIsrRetry(
+                                coordinatorEpoch, serverId, bucketsForServer);
+                        return;
+                    }
+                    // put the response receive event into the event manager
+                    eventManager.put(
+                            new NotifyLeaderAndIsrResponseReceivedEvent(
+                                    getNotifyLeaderAndIsrResponseData(response), serverId));
+                });
+    }
+
+    /**
+     * Schedules a one-shot retry of a failed notify-leader-and-isr send. At most one retry is
+     * pending per failed send; the retry re-sends through {@link #sendNotifyLeaderAndIsrToServer},
+     * whose own failure callback re-arms it again.
+     */
+    private void scheduleNotifyLeaderAndIsrRetry(
+            int coordinatorEpoch,
+            int serverId,
+            Map<TableBucket, PbNotifyLeaderAndIsrReqForBucket> bucketsForServer) {
+        if (!coordinatorContext.getLiveTabletServers().containsKey(serverId)) {
+            LOG.info(
+                    "Not retrying notify leader and isr request for tablet server {},"
+                            + " it is no longer live. Recovery is owned by the dead server path.",
+                    serverId);
+            return;
+        }
+        try {
+            scheduler.scheduleOnce(
+                    "notify-leader-and-isr-retry-" + serverId,
+                    () -> retryNotifyLeaderAndIsr(coordinatorEpoch, serverId, bucketsForServer),
+                    notifyLeaderAndIsrRetryDelayMs);
+        } catch (Throwable t) {
+            LOG.warn(
+                    "Failed to schedule notify leader and isr retry for tablet server {}.",
+                    serverId,
+                    t);
+        }
+    }
+
+    /**
+     * Runs when the retry fires. CoordinatorContext is not thread-safe, so the liveness check and
+     * the resend are routed to the coordinator event thread; the dead-server path owns recovery
+     * once the server is gone.
+     */
+    private void retryNotifyLeaderAndIsr(
+            int coordinatorEpoch,
+            int serverId,
+            Map<TableBucket, PbNotifyLeaderAndIsrReqForBucket> bucketsForServer) {
+        try {
+            eventManager.put(
+                    new AccessContextEvent<Void>(
+                            ctx -> {
+                                if (!ctx.getLiveTabletServers().containsKey(serverId)) {
+                                    LOG.info(
+                                            "Not retrying notify leader and isr request for tablet"
+                                                    + " server {}, it is no longer live. Recovery"
+                                                    + " is owned by the dead server path.",
+                                            serverId);
+                                    return null;
+                                }
+                                sendNotifyLeaderAndIsrToServer(
+                                        coordinatorEpoch, serverId, bucketsForServer);
+                                return null;
+                            }));
+        } catch (Throwable t) {
+            LOG.warn(
+                    "Failed to enqueue notify leader and isr retry for tablet server {}.",
+                    serverId,
+                    t);
+        }
     }
 
     private void sendStopRequest(int coordinatorEpoch) {
