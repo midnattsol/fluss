@@ -2131,6 +2131,16 @@ public class ConfigOptions {
                             "The interval to check the expiration of kv snapshot lease. "
                                     + "The default setting is 10 minutes.");
 
+    public static final ConfigOption<Boolean> KV_RESTORE_FROM_REMOTE_SNAPSHOT_ENABLED =
+            key("kv.restore-from-remote-snapshot.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether a replica with empty local state and no local kv snapshot may restore "
+                                    + "its kv tablet from the latest snapshot in remote storage (pinned by a "
+                                    + "snapshot lease while downloading) instead of restoring from the log only. "
+                                    + "Set to false to keep the previous behavior of restoring from the log.");
+
     public static final ConfigOption<Integer> KV_MAX_BACKGROUND_THREADS =
             key("kv.rocksdb.thread.num")
                     .intType()

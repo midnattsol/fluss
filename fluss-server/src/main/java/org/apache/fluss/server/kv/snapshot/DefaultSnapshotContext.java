@@ -23,6 +23,8 @@ import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseHandler;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseMetadataManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.utils.FlussPaths;
@@ -31,7 +33,9 @@ import org.apache.fluss.utils.function.FunctionWithException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -55,6 +59,10 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
 
     private final CompletedSnapshotHandleStore completedSnapshotHandleStore;
 
+    private final KvSnapshotLeaseMetadataManager leaseMetadataManager;
+
+    private final boolean restoreFromRemoteSnapshotEnabled;
+
     private final int maxFetchLogSizeInRecoverKv;
 
     private final int remoteLogPrefetchNumInRecoverKv;
@@ -74,6 +82,8 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             int writeBufferSizeInBytes,
             FsPath remoteKvDir,
             CompletedSnapshotHandleStore completedSnapshotHandleStore,
+            KvSnapshotLeaseMetadataManager leaseMetadataManager,
+            boolean restoreFromRemoteSnapshotEnabled,
             int maxFetchLogSizeInRecoverKv,
             int remoteLogPrefetchNumInRecoverKv,
             int remoteLogDownloadThreadsInRecoverKv) {
@@ -88,6 +98,8 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
         this.remoteKvDir = remoteKvDir;
 
         this.completedSnapshotHandleStore = completedSnapshotHandleStore;
+        this.leaseMetadataManager = leaseMetadataManager;
+        this.restoreFromRemoteSnapshotEnabled = restoreFromRemoteSnapshotEnabled;
         this.maxFetchLogSizeInRecoverKv = maxFetchLogSizeInRecoverKv;
         this.remoteLogPrefetchNumInRecoverKv = remoteLogPrefetchNumInRecoverKv;
         this.remoteLogDownloadThreadsInRecoverKv = remoteLogDownloadThreadsInRecoverKv;
@@ -109,6 +121,9 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
                 (int) conf.get(ConfigOptions.REMOTE_FS_WRITE_BUFFER_SIZE).getBytes(),
                 FlussPaths.remoteKvDir(conf),
                 new ZooKeeperCompletedSnapshotHandleStore(zkClient),
+                new KvSnapshotLeaseMetadataManager(
+                        zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR)),
+                conf.get(ConfigOptions.KV_RESTORE_FROM_REMOTE_SNAPSHOT_ENABLED),
                 (int) conf.get(ConfigOptions.KV_RECOVER_LOG_RECORD_BATCH_MAX_SIZE).getBytes(),
                 conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_PREFETCH_NUM),
                 conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_DOWNLOAD_THREADS));
@@ -165,6 +180,59 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             } else {
                 return null;
             }
+        };
+    }
+
+    @Override
+    public boolean isRemoteSnapshotRestoreEnabled() {
+        return restoreFromRemoteSnapshotEnabled;
+    }
+
+    @Override
+    public Optional<CompletedSnapshot> getLatestRemoteSnapshot(TableBucket tableBucket)
+            throws Exception {
+        List<CompletedSnapshotHandle> handles =
+                completedSnapshotHandleStore.getAllCompletedSnapshotHandles(tableBucket);
+        CompletedSnapshot latest = null;
+        for (CompletedSnapshotHandle handle : handles) {
+            CompletedSnapshot snapshot;
+            try {
+                snapshot = handle.retrieveCompleteSnapshot();
+            } catch (Exception e) {
+                LOG.warn(
+                        "Failed to retrieve remote snapshot metadata {} for bucket {}, skipping it.",
+                        handle,
+                        tableBucket,
+                        e);
+                continue;
+            }
+            if (latest == null || snapshot.getSnapshotID() > latest.getSnapshotID()) {
+                latest = snapshot;
+            }
+        }
+        return Optional.ofNullable(latest);
+    }
+
+    @Override
+    public RemoteSnapshotLease acquireRemoteSnapshotLease(
+            TableBucket tableBucket, long snapshotId, long leaseDurationMs) throws Exception {
+        String leaseId = "restore-" + UUID.randomUUID();
+        long expirationTime = System.currentTimeMillis() + leaseDurationMs;
+        KvSnapshotLeaseHandler leaseHandler = new KvSnapshotLeaseHandler(expirationTime);
+        leaseHandler.acquireBucket(tableBucket, snapshotId, tableBucket.getBucket() + 1);
+        leaseMetadataManager.registerLease(leaseId, leaseHandler);
+        LOG.info(
+                "Acquired remote snapshot lease {} for snapshot {} of bucket {}.",
+                leaseId,
+                snapshotId,
+                tableBucket);
+        return () -> {
+            leaseMetadataManager.deleteLease(leaseId);
+            LOG.info(
+                    "Released remote snapshot lease {} for snapshot {} of bucket {}.",
+                    leaseId,
+                    snapshotId,
+                    tableBucket);
         };
     }
 

@@ -23,6 +23,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.utils.function.FunctionWithException;
 
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -64,6 +65,50 @@ public interface SnapshotContext {
      */
     FunctionWithException<TableBucket, CompletedSnapshot, Exception>
             getLatestCompletedSnapshotProvider();
+
+    /**
+     * Whether a replica with empty local state and no local snapshot may restore its kv tablet from
+     * a snapshot in remote storage. See {@code kv.restore-from-remote-snapshot.enabled}.
+     *
+     * @return true if restoring from a remote snapshot is enabled
+     */
+    default boolean isRemoteSnapshotRestoreEnabled() {
+        return true;
+    }
+
+    /**
+     * Discover the latest snapshot available in remote storage for the given table bucket. Unlike
+     * {@link #getLatestCompletedSnapshotProvider()}, which serves the local snapshot view, this
+     * looks up snapshots whose files live in remote storage so that an empty replica (e.g. after
+     * total local loss) can bootstrap from them. Snapshots whose metadata can no longer be read are
+     * skipped.
+     *
+     * @param tableBucket the table bucket to discover the remote snapshot for
+     * @return the latest readable remote snapshot, or {@link Optional#empty()} when no remote
+     *     snapshot exists
+     * @throws Exception if discovering the remote snapshots failed
+     */
+    default Optional<CompletedSnapshot> getLatestRemoteSnapshot(TableBucket tableBucket)
+            throws Exception {
+        return Optional.empty();
+    }
+
+    /**
+     * Acquire a lease pinning the given remote snapshot for the duration of a restore, so that the
+     * snapshot is not deleted while its files are being downloaded. The caller must {@link
+     * RemoteSnapshotLease#close() close} the returned lease once the restore no longer needs the
+     * snapshot.
+     *
+     * @param tableBucket the table bucket the snapshot belongs to
+     * @param snapshotId the id of the snapshot to pin
+     * @param leaseDurationMs the lease duration in milliseconds
+     * @return the acquired lease, never null
+     * @throws Exception if acquiring the lease failed
+     */
+    default RemoteSnapshotLease acquireRemoteSnapshotLease(
+            TableBucket tableBucket, long snapshotId, long leaseDurationMs) throws Exception {
+        return () -> {};
+    }
 
     /**
      * Handles broken snapshots.
