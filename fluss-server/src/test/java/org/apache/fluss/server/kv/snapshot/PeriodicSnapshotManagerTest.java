@@ -90,6 +90,23 @@ class PeriodicSnapshotManagerTest {
     }
 
     @Test
+    void testInitializationFailureSchedulesAnotherAttempt() {
+        periodicSnapshotManager =
+                createSnapshotManager(
+                        new NopSnapshotTarget() {
+                            @Override
+                            public Optional<PeriodicSnapshotManager.SnapshotRunnable>
+                                    initSnapshot() {
+                                throw new IllegalStateException("remote storage unavailable");
+                            }
+                        });
+        periodicSnapshotManager.start();
+        scheduledExecutorService.triggerNonPeriodicScheduledTasks();
+
+        checkOnlyOneScheduledTasks();
+    }
+
+    @Test
     void testSnapshot() {
         // use local filesystem to make the FileSystem plugin happy
         String snapshotDir = "file:/test/snapshot1";

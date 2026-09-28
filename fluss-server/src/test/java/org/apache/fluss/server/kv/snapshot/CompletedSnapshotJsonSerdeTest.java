@@ -69,7 +69,17 @@ class CompletedSnapshotJsonSerdeTest extends JsonSerdeTestBase<CompletedSnapshot
                         10,
                         1234L,
                         Collections.singletonList(new AutoIncIDRange(2, 10000, 20000)));
-        return new CompletedSnapshot[] {completedSnapshot1, completedSnapshot2};
+        CompletedSnapshot completedSnapshot3 =
+                new CompletedSnapshot(
+                        new TableBucket(1, 1),
+                        1,
+                        new FsPath("oss://bucket/snapshot"),
+                        KvSnapshotHandle.create(sharedFileHandles, privateFileHandles, 5),
+                        10,
+                        null,
+                        null,
+                        new FsPath("oss://bucket/snapshot/_WRITER_STATE"));
+        return new CompletedSnapshot[] {completedSnapshot1, completedSnapshot2, completedSnapshot3};
     }
 
     @Override
@@ -94,7 +104,17 @@ class CompletedSnapshotJsonSerdeTest extends JsonSerdeTestBase<CompletedSnapshot
                     + "{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/shared/t2.sst\",\"size\":2},\"local_path\":\"localPath2\"}],"
                     + "\"private_file_handles\":[{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/snapshot1/t3\",\"size\":3},\"local_path\":\"localPath3\"},"
                     + "{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/snapshot1/t4\",\"size\":4},\"local_path\":\"localPath4\"}],"
-                    + "\"snapshot_incremental_size\":5},\"log_offset\":10,\"row_count\":1234,\"auto_inc_id_range\":[{\"column_id\":2,\"start\":10000,\"end\":20000}]}"
+                    + "\"snapshot_incremental_size\":5},\"log_offset\":10,\"row_count\":1234,\"auto_inc_id_range\":[{\"column_id\":2,\"start\":10000,\"end\":20000}]}",
+            "{\"version\":1,"
+                    + "\"table_id\":1,\"bucket_id\":1,"
+                    + "\"snapshot_id\":1,"
+                    + "\"snapshot_location\":\"oss://bucket/snapshot\","
+                    + "\"kv_snapshot_handle\":{"
+                    + "\"shared_file_handles\":[{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/shared/t1.sst\",\"size\":1},\"local_path\":\"localPath1\"},"
+                    + "{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/shared/t2.sst\",\"size\":2},\"local_path\":\"localPath2\"}],"
+                    + "\"private_file_handles\":[{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/snapshot1/t3\",\"size\":3},\"local_path\":\"localPath3\"},"
+                    + "{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/snapshot1/t4\",\"size\":4},\"local_path\":\"localPath4\"}],"
+                    + "\"snapshot_incremental_size\":5},\"log_offset\":10,\"writer_snapshot_path\":\"oss://bucket/snapshot/_WRITER_STATE\"}"
         };
     }
 }

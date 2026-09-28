@@ -42,6 +42,7 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.server.log.LocalLog.SegmentDeletionReason;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
+import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.concurrent.Scheduler;
@@ -64,6 +65,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -99,6 +101,15 @@ public final class LogTablet {
     private final long logFlushIntervalMessages;
     // A lock that guards all modifications to the localLog.
     private final Object lock = new Object();
+
+    @GuardedBy("lock")
+    private final TreeMap<Long, Integer> pinnedWriterReplayOffsets = new TreeMap<>();
+
+    @GuardedBy("lock")
+    private long cachedKvWriterOffset = -1L;
+
+    @GuardedBy("lock")
+    private byte[] cachedKvWriters;
 
     @GuardedBy("lock")
     private final WriterStateManager writerStateManager;
@@ -228,6 +239,122 @@ public final class LogTablet {
 
     public long localLogEndOffset() {
         return localLog.getLocalLogEndOffset();
+    }
+
+    /** Exclusive end of the committed remote log, or -1 when no manifest exists. */
+    public long remoteLogEndOffset() {
+        return remoteLogEndOffset;
+    }
+
+    /** Pins the local log prefix needed to reconstruct writer state at a KV snapshot's offset. */
+    public WriterCheckpoint pinWriterCheckpoint(long offset) throws IOException {
+        final long baseOffset;
+        final byte[] baseCheckpoint;
+        synchronized (lock) {
+            if (offset > localLogEndOffset()) {
+                throw new IOException("Writer checkpoint offset exceeds local log end: " + offset);
+            }
+            Optional<Long> base = writerStateManager.latestSnapshotAtOrBefore(offset);
+            boolean useCache =
+                    cachedKvWriters != null
+                            && cachedKvWriterOffset <= offset
+                            && cachedKvWriterOffset > base.orElse(-1L);
+            baseOffset = useCache ? cachedKvWriterOffset : base.orElse(0L);
+            if (baseOffset < localLogStartOffset() && baseOffset != offset) {
+                throw new IOException(
+                        "Cannot reconstruct writer state at "
+                                + offset
+                                + " from local log start "
+                                + localLogStartOffset()
+                                + " and writer checkpoint "
+                                + baseOffset);
+            }
+            baseCheckpoint =
+                    useCache
+                            ? cachedKvWriters
+                            : base.isPresent()
+                                    ? Files.readAllBytes(
+                                            writerStateManager
+                                                    .fetchSnapshot(baseOffset)
+                                                    .get()
+                                                    .toPath())
+                                    : null;
+            pinnedWriterReplayOffsets.merge(baseOffset, 1, Integer::sum);
+        }
+        return new WriterCheckpoint() {
+            @Override
+            public byte[] build() throws IOException {
+                if (baseOffset == offset && baseCheckpoint != null) {
+                    return baseCheckpoint;
+                }
+                File scratch =
+                        Files.createTempDirectory(
+                                        localLog.getLogTabletDir().toPath(), "writer-replay-")
+                                .toFile();
+                try {
+                    if (baseCheckpoint != null) {
+                        Files.write(
+                                FlussPaths.writerSnapshotFile(scratch, baseOffset).toPath(),
+                                baseCheckpoint);
+                    }
+                    WriterStateManager detached =
+                            new WriterStateManager(
+                                    getTableBucket(),
+                                    scratch,
+                                    writerStateManager.writerExpirationMs());
+                    // The concurrent segment map may gain newer entries while we replay, but the
+                    // bounded end offset and local retention pin keep the required prefix stable.
+                    rebuildWriterState(detached, localLog.getSegments(), 0L, offset, false);
+                    return Files.readAllBytes(detached.fetchSnapshot(offset).get().toPath());
+                } finally {
+                    FileUtils.deleteDirectoryQuietly(scratch);
+                }
+            }
+
+            @Override
+            public void close() {
+                synchronized (lock) {
+                    int count = pinnedWriterReplayOffsets.get(baseOffset);
+                    if (count == 1) {
+                        pinnedWriterReplayOffsets.remove(baseOffset);
+                    } else {
+                        pinnedWriterReplayOffsets.put(baseOffset, count - 1);
+                    }
+                }
+            }
+        };
+    }
+
+    /** A retained prefix and an independent, bounded writer-state rebuild. */
+    public interface WriterCheckpoint extends AutoCloseable {
+        byte[] build() throws IOException;
+
+        @Override
+        void close();
+    }
+
+    /**
+     * Retain only the latest committed KV writer base; replay cost stays proportional to the log
+     * written since the preceding successful snapshot.
+     */
+    public void cacheKvWriterCheckpoint(long offset, byte[] checkpoint) {
+        synchronized (lock) {
+            if (offset > cachedKvWriterOffset) {
+                cachedKvWriterOffset = offset;
+                cachedKvWriters = checkpoint;
+            }
+        }
+    }
+
+    /** Restore the writer checkpoint after resetting a lost log to the KV snapshot's offset. */
+    public void restoreWriterCheckpoint(byte[] checkpoint, long offset) throws IOException {
+        synchronized (lock) {
+            if (localLogStartOffset() != offset || localLogEndOffset() != offset) {
+                throw new IOException("Log does not start at restored snapshot offset " + offset);
+            }
+            writerStateManager.restoreSnapshotAtOffset(
+                    checkpoint, offset, System.currentTimeMillis());
+        }
     }
 
     public long localMaxTimestamp() {
@@ -873,9 +1000,16 @@ public final class LogTablet {
 
         try {
             // shouldn't clean up segments that will be used by kv recovery.
-            long effectiveCleanupToOffset =
-                    Math.min(minRetainOffset.get(), requestedCleanupToOffset);
-            cleanupAction.cleanup(effectiveCleanupToOffset);
+            synchronized (lock) {
+                long effectiveCleanupToOffset =
+                        Math.min(minRetainOffset.get(), requestedCleanupToOffset);
+                if (!pinnedWriterReplayOffsets.isEmpty()) {
+                    effectiveCleanupToOffset =
+                            Math.min(
+                                    effectiveCleanupToOffset, pinnedWriterReplayOffsets.firstKey());
+                }
+                cleanupAction.cleanup(effectiveCleanupToOffset);
+            }
         } catch (IOException e) {
             LOG.error(
                     "Failed to delete the local log segments to cleanUpToOffset {} for table-bucket {}.",

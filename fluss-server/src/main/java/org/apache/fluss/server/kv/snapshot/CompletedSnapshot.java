@@ -85,6 +85,9 @@ public class CompletedSnapshot {
      */
     @Nullable private final List<AutoIncIDRange> autoIncIDRanges;
 
+    /** Writer checkpoint at exactly {@link #logOffset}; absent in older snapshots. */
+    @Nullable private final FsPath writerSnapshotPath;
+
     /** The location where the snapshot is stored. */
     private final FsPath snapshotLocation;
 
@@ -101,6 +104,26 @@ public class CompletedSnapshot {
             long logOffset,
             @Nullable Long rowCount,
             @Nullable List<AutoIncIDRange> autoIncIDRanges) {
+        this(
+                tableBucket,
+                snapshotID,
+                snapshotLocation,
+                kvSnapshotHandle,
+                logOffset,
+                rowCount,
+                autoIncIDRanges,
+                null);
+    }
+
+    public CompletedSnapshot(
+            TableBucket tableBucket,
+            long snapshotID,
+            FsPath snapshotLocation,
+            KvSnapshotHandle kvSnapshotHandle,
+            long logOffset,
+            @Nullable Long rowCount,
+            @Nullable List<AutoIncIDRange> autoIncIDRanges,
+            @Nullable FsPath writerSnapshotPath) {
         this.tableBucket = tableBucket;
         this.snapshotID = snapshotID;
         this.snapshotLocation = snapshotLocation;
@@ -108,6 +131,7 @@ public class CompletedSnapshot {
         this.logOffset = logOffset;
         this.rowCount = rowCount;
         this.autoIncIDRanges = autoIncIDRanges;
+        this.writerSnapshotPath = writerSnapshotPath;
     }
 
     @VisibleForTesting
@@ -133,6 +157,11 @@ public class CompletedSnapshot {
 
     public long getLogOffset() {
         return logOffset;
+    }
+
+    @Nullable
+    public FsPath getWriterSnapshotPath() {
+        return writerSnapshotPath;
     }
 
     @Nullable
@@ -176,8 +205,20 @@ public class CompletedSnapshot {
         CompletableFuture<Void> discardMetaFileFuture =
                 FutureUtils.runAsync(this::disposeMetadata, ioExecutor);
 
+        CompletableFuture<Void> discardWriterFuture =
+                FutureUtils.runAsync(
+                        () -> {
+                            if (writerSnapshotPath != null) {
+                                writerSnapshotPath
+                                        .getFileSystem()
+                                        .delete(writerSnapshotPath, false);
+                            }
+                        },
+                        ioExecutor);
+
         return FutureUtils.runAfterwards(
-                FutureUtils.completeAll(Arrays.asList(discardKvFuture, discardMetaFileFuture)),
+                FutureUtils.completeAll(
+                        Arrays.asList(discardKvFuture, discardMetaFileFuture, discardWriterFuture)),
                 this::disposeSnapshotStorage);
     }
 
@@ -273,6 +314,7 @@ public class CompletedSnapshot {
                 && Objects.equals(kvSnapshotHandle, that.kvSnapshotHandle)
                 && Objects.equals(rowCount, that.rowCount)
                 && Objects.equals(autoIncIDRanges, that.autoIncIDRanges)
+                && Objects.equals(writerSnapshotPath, that.writerSnapshotPath)
                 && Objects.equals(snapshotLocation, that.snapshotLocation);
     }
 
@@ -285,6 +327,7 @@ public class CompletedSnapshot {
                 logOffset,
                 rowCount,
                 autoIncIDRanges,
+                writerSnapshotPath,
                 snapshotLocation);
     }
 }

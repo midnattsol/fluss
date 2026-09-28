@@ -211,6 +211,7 @@ public class PeriodicSnapshotManager implements Closeable {
                             snapshotRunnableOptional = target.initSnapshot();
                         } catch (Exception e) {
                             LOG.error("Fail to init snapshot during triggering snapshot.", e);
+                            scheduleNextSnapshot();
                             return;
                         }
                         if (snapshotRunnableOptional.isPresent()) {

@@ -40,6 +40,39 @@ import java.util.Map;
 /** The data and path stored in ZooKeeper nodes (znodes). */
 public final class ZkData {
 
+    /** Persistent evidence of snapshot-based recovery after loss of a local log. */
+    public static final class LimitedRecoveryZNode {
+        public static String root() {
+            return "/recovery/limited";
+        }
+
+        public static String path(TableBucket tableBucket) {
+            String partition =
+                    tableBucket.getPartitionId() == null
+                            ? "none"
+                            : tableBucket.getPartitionId().toString();
+            return root()
+                    + "/"
+                    + tableBucket.getTableId()
+                    + "-"
+                    + partition
+                    + "-"
+                    + tableBucket.getBucket();
+        }
+    }
+
+    /** Written once per bucket, before its first KV log append can be acknowledged. */
+    public static final class KvEverWrittenZNode {
+        public static String path(TableBucket tableBucket) {
+            return "/recovery/written/"
+                    + tableBucket.getTableId()
+                    + "-"
+                    + (tableBucket.getPartitionId() == null ? "none" : tableBucket.getPartitionId())
+                    + "-"
+                    + tableBucket.getBucket();
+        }
+    }
+
     // ------------------------------------------------------------------------------------------
     // ZNodes under "/metadata/"
     // ------------------------------------------------------------------------------------------

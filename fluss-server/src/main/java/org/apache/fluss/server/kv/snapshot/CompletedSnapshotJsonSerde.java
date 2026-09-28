@@ -62,6 +62,7 @@ public class CompletedSnapshotJsonSerde
 
     // for the next log offset when the snapshot is triggered;
     private static final String LOG_OFFSET = "log_offset";
+    private static final String WRITER_SNAPSHOT_PATH = "writer_snapshot_path";
     private static final String ROW_COUNT = "row_count";
     private static final String AUTO_INC_ID_RANGE = "auto_inc_id_range";
     private static final String AUTO_INC_COLUMN_ID = "column_id";
@@ -112,6 +113,10 @@ public class CompletedSnapshotJsonSerde
 
         // serialize log offset
         generator.writeNumberField(LOG_OFFSET, completedSnapshot.getLogOffset());
+        if (completedSnapshot.getWriterSnapshotPath() != null) {
+            generator.writeStringField(
+                    WRITER_SNAPSHOT_PATH, completedSnapshot.getWriterSnapshotPath().toString());
+        }
 
         // ROW_COUNT and AUTO_INC_ID_RANGE are added in v0.9, but they are nullable and optional, so
         // we don't bump JSON version here to guarantee the RPC protocol compatibility between
@@ -218,7 +223,10 @@ public class CompletedSnapshotJsonSerde
                 kvSnapshotHandle,
                 logOffset,
                 rowCount,
-                autoIncIDRanges);
+                autoIncIDRanges,
+                node.has(WRITER_SNAPSHOT_PATH)
+                        ? new FsPath(node.get(WRITER_SNAPSHOT_PATH).asText())
+                        : null);
     }
 
     private List<KvFileHandleAndLocalPath> deserializeKvFileHandles(

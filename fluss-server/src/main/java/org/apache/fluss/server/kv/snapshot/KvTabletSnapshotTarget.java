@@ -20,25 +20,32 @@ package org.apache.fluss.server.kv.snapshot;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.fs.FSDataOutputStream;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.SequenceIDCounter;
+import org.apache.fluss.server.log.LogTablet.WriterCheckpoint;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
+import org.apache.fluss.utils.function.FunctionWithException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -79,6 +86,23 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
 
     /** The executor used for asynchronous calls, like potentially blocking I/O. */
     private final Executor ioExecutor;
+
+    private final Map<Long, WriterCheckpoint> writerCheckpoints = new ConcurrentHashMap<>();
+
+    @Nullable
+    private FunctionWithException<Long, WriterCheckpoint, IOException> writerCheckpointProvider;
+
+    @Nullable private BiConsumer<Long, byte[]> writerCheckpointCache;
+
+    /** Add writer state to new snapshots when a log checkpoint matches their exact KV offset. */
+    public void setWriterCheckpointProvider(
+            FunctionWithException<Long, WriterCheckpoint, IOException> provider) {
+        this.writerCheckpointProvider = provider;
+    }
+
+    public void setWriterCheckpointCache(BiConsumer<Long, byte[]> cache) {
+        this.writerCheckpointCache = cache;
+    }
 
     private volatile long logOffsetOfLatestSnapshot;
 
@@ -186,6 +210,9 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         int coordinatorEpoch = coordinatorEpochSupplier.get();
         SnapshotLocation snapshotLocation = initSnapshotLocation(currentSnapshotId);
         try {
+            if (writerCheckpointProvider != null) {
+                writerCheckpoints.put(currentSnapshotId, writerCheckpointProvider.apply(logOffset));
+            }
             PeriodicSnapshotManager.SnapshotRunnable snapshotRunnable =
                     new PeriodicSnapshotManager.SnapshotRunnable(
                             snapshotRunner.snapshot(
@@ -196,17 +223,17 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                             snapshotLocation);
             return Optional.of(snapshotRunnable);
         } catch (Exception t) {
+            closeWriterCheckpoint(currentSnapshotId);
             // dispose the snapshot location
             snapshotLocation.disposeOnFailure();
             throw t;
         }
     }
 
-    private SnapshotLocation initSnapshotLocation(long snapshotId) throws IOException {
+    private SnapshotLocation initSnapshotLocation(long snapshotId) {
         final FsPath currentSnapshotDir =
                 FlussPaths.remoteKvSnapshotDir(remoteKvTabletDir, snapshotId);
-        // create the snapshot exclusive directory
-        remoteFileSystem.mkdirs(currentSnapshotDir);
+        // Remote directory creation happens during the async upload, outside the tablet's KV lock.
         return new SnapshotLocation(
                 remoteFileSystem,
                 currentSnapshotDir,
@@ -223,6 +250,26 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             SnapshotResult snapshotResult)
             throws Throwable {
         TabletState tabletState = snapshotResult.getTabletState();
+        WriterCheckpoint writerCheckpoint = writerCheckpoints.remove(snapshotId);
+        FsPath writerPath = null;
+        byte[] writerBytes = null;
+        if (writerCheckpoint != null) {
+            writerPath = new FsPath(snapshotLocation.getSnapshotDirectory(), "_WRITER_STATE");
+            try {
+                writerBytes = writerCheckpoint.build();
+                try (FSDataOutputStream stream =
+                        remoteFileSystem.create(writerPath, FileSystem.WriteMode.NO_OVERWRITE)) {
+                    stream.write(writerBytes);
+                }
+            } catch (Exception e) {
+                // The handle also includes shared SSTs retained by older snapshots: deleting it
+                // here could destroy a committed snapshot. The exclusive directory is disposable.
+                handleSnapshotFailure(snapshotId, snapshotLocation, e);
+                throw e;
+            } finally {
+                writerCheckpoint.close();
+            }
+        }
         CompletedSnapshot completedSnapshot =
                 new CompletedSnapshot(
                         tableBucket,
@@ -231,7 +278,8 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                         snapshotResult.getKvSnapshotHandle(),
                         tabletState.getFlushedLogOffset(),
                         tabletState.getRowCount(),
-                        tabletState.getAutoIncIDRanges());
+                        tabletState.getAutoIncIDRanges(),
+                        writerPath);
         try {
             // commit the completed snapshot
             completedKvSnapshotCommitter.commitKvSnapshot(
@@ -244,11 +292,19 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             handleSnapshotCommitException(
                     snapshotId, snapshotResult, completedSnapshot, snapshotLocation, t);
         }
+        if (writerBytes != null && writerCheckpointCache != null) {
+            try {
+                writerCheckpointCache.accept(tabletState.getFlushedLogOffset(), writerBytes);
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to cache writer state for snapshot {}.", snapshotId, e);
+            }
+        }
     }
 
     @Override
     public void handleSnapshotFailure(
             long snapshotId, SnapshotLocation snapshotLocation, Throwable cause) {
+        closeWriterCheckpoint(snapshotId);
         LOG.warn(
                 "Snapshot {} failure or cancellation for TableBucket {}.",
                 snapshotId,
@@ -257,6 +313,13 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         rocksIncrementalSnapshot.notifySnapshotAbort(snapshotId);
         // cleanup the target snapshot location at the end
         snapshotLocation.disposeOnFailure();
+    }
+
+    private void closeWriterCheckpoint(long snapshotId) {
+        WriterCheckpoint source = writerCheckpoints.remove(snapshotId);
+        if (source != null) {
+            source.close();
+        }
     }
 
     @Override
