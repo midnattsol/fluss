@@ -19,10 +19,15 @@ package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableBucketReplica;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePartition;
+import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.PbStopReplicaReqForBucket;
+import org.apache.fluss.rpc.messages.StopReplicaRequest;
+import org.apache.fluss.rpc.messages.StopReplicaResponse;
 import org.apache.fluss.server.coordinator.event.CoordinatorEvent;
 import org.apache.fluss.server.coordinator.event.DeleteReplicaResponseReceivedEvent;
 import org.apache.fluss.server.coordinator.event.ResumeDropEvent;
@@ -32,6 +37,7 @@ import org.apache.fluss.server.coordinator.statemachine.TableBucketStateMachine;
 import org.apache.fluss.server.entity.DeleteReplicaResultForBucket;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
 import org.apache.fluss.server.metadata.ServerInfo;
+import org.apache.fluss.server.tablet.TestTabletServerGateway;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -41,6 +47,7 @@ import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.utils.clock.SystemClock;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -53,14 +60,18 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
@@ -70,6 +81,7 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.server.coordinator.statemachine.BucketState.OnlineBucket;
 import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.OnlineReplica;
+import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.ReplicaDeletionStarted;
 import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.ReplicaDeletionSuccessful;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -87,6 +99,7 @@ class TableManagerTest {
 
     private CoordinatorContext coordinatorContext;
     private ReplicaCapacityController replicaCapacityController;
+    private ReplicaStateMachine replicaStateMachine;
     private TableManager tableManager;
     private TableLifecycleThrottler lifecycleThrottler;
     private TestingEventManager testingEventManager;
@@ -133,7 +146,7 @@ class TableManagerTest {
         CoordinatorRequestBatch coordinatorRequestBatch =
                 new CoordinatorRequestBatch(
                         testCoordinatorChannelManager, testingEventManager, coordinatorContext);
-        ReplicaStateMachine replicaStateMachine =
+        replicaStateMachine =
                 new ReplicaStateMachine(
                         coordinatorContext, coordinatorRequestBatch, zookeeperClient);
         TableBucketStateMachine tableBucketStateMachine =
@@ -291,6 +304,113 @@ class TableManagerTest {
     }
 
     @Test
+    void testDeleteTableWithTransportFailureThenSuccess() throws Exception {
+        // A transport-level loss of stopReplica(delete=true) must feed back into the deletion
+        // retry chain instead of wedging the table in ReplicaDeletionStarted forever.
+        AtomicBoolean failDeleteTransport = new AtomicBoolean(true);
+        Map<Integer, TabletServerGateway> gateways = new HashMap<>();
+        for (int serverId : Arrays.asList(0, 1, 2)) {
+            gateways.put(serverId, new TransportFailingGateway(failDeleteTransport));
+        }
+        testCoordinatorChannelManager.setGateways(gateways);
+
+        // first, create a table
+        long tableId = zookeeperClient.getTableIdAndIncrement();
+        TableAssignment assignment = createAssignment();
+        zookeeperClient.registerTableAssignment(tableId, assignment);
+
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        DATA1_TABLE_PATH_PK,
+                        tableId,
+                        0,
+                        DATA1_TABLE_DESCRIPTOR_PK,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+        tableManager.onCreateNewTable(DATA1_TABLE_PATH_PK, tableId, assignment);
+
+        // now, delete the created table; every stopReplica(delete=true) send fails at transport
+        // level
+        coordinatorContext.queueTableDeletion(Collections.singleton(tableId));
+        tableManager.onDeleteTable(tableId);
+
+        // all replicas advanced to ReplicaDeletionStarted, but nothing was acked
+        Set<TableBucketReplica> replicas = getReplicas(tableId, assignment);
+        for (TableBucketReplica replica : replicas) {
+            assertThat(coordinatorContext.getReplicaState(replica))
+                    .isEqualTo(ReplicaDeletionStarted);
+        }
+
+        // the transport failures must have been fed back as failed delete results
+        List<DeleteReplicaResultForBucket> failedResults = collectDeleteResults();
+        assertThat(failedResults).hasSize(replicas.size());
+        for (DeleteReplicaResultForBucket result : failedResults) {
+            assertThat(result.failed()).isTrue();
+        }
+
+        // the tablet servers are reachable again; drive the retry chain the coordinator event
+        // thread would run (see CoordinatorEventProcessor#processDeleteReplicaResponseReceived)
+        failDeleteTransport.set(false);
+        dispatchDeleteReplicaEvents();
+        // the retry re-sent stopReplica(delete=true), which now succeeds
+        dispatchDeleteReplicaEvents();
+
+        // all replicas must now be deletion-successful ...
+        for (TableBucketReplica replica : replicas) {
+            assertThat(coordinatorContext.getReplicaState(replica))
+                    .isEqualTo(ReplicaDeletionSuccessful);
+        }
+        // ... and the table deletion completes: ZK assignment gone, context cleaned up
+        retry(
+                Duration.ofSeconds(30),
+                () -> assertThat(zookeeperClient.getTableAssignment(tableId)).isEmpty());
+        assertThat(coordinatorContext.getAllReplicasForTable(tableId)).isEmpty();
+    }
+
+    @Test
+    void testResumeDeletionsDefersTableWithReplicaInDeletionStarted() throws Exception {
+        // A table with any replica left in ReplicaDeletionStarted must stay deferred: resume must
+        // neither complete the deletion nor re-submit it (Kafka-ported gate against duplicate
+        // delete storms). Recovery of the stuck replica is owned by the delete-replica retry
+        // chain, not by resume.
+        long tableId = zookeeperClient.getTableIdAndIncrement();
+        TableAssignment assignment = createAssignment();
+        zookeeperClient.registerTableAssignment(tableId, assignment);
+
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        DATA1_TABLE_PATH_PK,
+                        tableId,
+                        0,
+                        DATA1_TABLE_DESCRIPTOR_PK,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+        tableManager.onCreateNewTable(DATA1_TABLE_PATH_PK, tableId, assignment);
+
+        coordinatorContext.queueTableDeletion(Collections.singleton(tableId));
+        tableManager.onDeleteTable(tableId);
+
+        // leave the replicas in ReplicaDeletionStarted: drop the responses without driving them,
+        // as if the acks were lost
+        testingEventManager.clearEvents();
+
+        tableManager.resumeDeletions();
+
+        // the gate defers: no resume re-submitted ...
+        for (CoordinatorEvent event : testingEventManager.getEvents()) {
+            assertThat(event).isNotInstanceOf(ResumeDropEvent.class);
+        }
+        // ... and the deletion is not completed either
+        assertThat(coordinatorContext.getTablesToBeDeleted()).contains(tableId);
+        assertThat(coordinatorContext.getAllReplicasForTable(tableId)).isNotEmpty();
+        assertThat(zookeeperClient.getTableAssignment(tableId)).isPresent();
+
+        zookeeperClient.deleteTableAssignment(tableId);
+    }
+
+    @Test
     void testCreateAndDropPartition() throws Exception {
         // create a table
         long tableId = zookeeperClient.getTableIdAndIncrement();
@@ -437,6 +557,87 @@ class TableManagerTest {
             }
         }
         return deleteReplicaResponseReceivedEvent;
+    }
+
+    private List<DeleteReplicaResultForBucket> collectDeleteResults() {
+        List<DeleteReplicaResultForBucket> results = new ArrayList<>();
+        for (CoordinatorEvent event : testingEventManager.getEvents()) {
+            if (event instanceof DeleteReplicaResponseReceivedEvent) {
+                results.addAll(
+                        ((DeleteReplicaResponseReceivedEvent) event).getDeleteReplicaResults());
+            }
+        }
+        return results;
+    }
+
+    /**
+     * Drives every pending {@link DeleteReplicaResponseReceivedEvent} through the same steps as
+     * {@code CoordinatorEventProcessor#processDeleteReplicaResponseReceived} (clear success counts,
+     * retry failures via ReplicaDeletionStarted, mark successes as ReplicaDeletionSuccessful,
+     * resume on success) so unit tests can run the deletion retry chain without the real event
+     * loop.
+     */
+    private void dispatchDeleteReplicaEvents() {
+        List<CoordinatorEvent> pending = new ArrayList<>(testingEventManager.getEvents());
+        testingEventManager.clearEvents();
+        Set<TableBucketReplica> failDeletedReplicas = new HashSet<>();
+        Set<TableBucketReplica> successDeletedReplicas = new HashSet<>();
+        for (CoordinatorEvent event : pending) {
+            if (event instanceof DeleteReplicaResponseReceivedEvent) {
+                for (DeleteReplicaResultForBucket result :
+                        ((DeleteReplicaResponseReceivedEvent) event).getDeleteReplicaResults()) {
+                    if (result.succeeded()) {
+                        successDeletedReplicas.add(result.getTableBucketReplica());
+                    } else {
+                        failDeletedReplicas.add(result.getTableBucketReplica());
+                    }
+                }
+            }
+        }
+        if (failDeletedReplicas.isEmpty() && successDeletedReplicas.isEmpty()) {
+            return;
+        }
+        coordinatorContext.clearFailDeleteNumbers(successDeletedReplicas);
+        Tuple2<Set<TableBucketReplica>, Set<TableBucketReplica>> retryAndSuccess =
+                coordinatorContext.retryDeleteAndSuccessDeleteReplicas(failDeletedReplicas);
+        replicaStateMachine.handleStateChanges(retryAndSuccess.f0, ReplicaDeletionStarted);
+        successDeletedReplicas.addAll(retryAndSuccess.f1);
+        replicaStateMachine.handleStateChanges(successDeletedReplicas, ReplicaDeletionSuccessful);
+        if (!successDeletedReplicas.isEmpty()) {
+            tableManager.resumeDeletions();
+        }
+    }
+
+    /**
+     * A tablet gateway that fails stopReplica(delete=true) sends at transport level while the flag
+     * is set, then behaves like the always-success gateway. Per-bucket tablet-side errors are
+     * unaffected: only transport-level loss is simulated here.
+     */
+    private static final class TransportFailingGateway extends TestTabletServerGateway {
+        private final AtomicBoolean failDeleteTransport;
+
+        private TransportFailingGateway(AtomicBoolean failDeleteTransport) {
+            super(false, Collections.emptySet());
+            this.failDeleteTransport = failDeleteTransport;
+        }
+
+        @Override
+        public CompletableFuture<StopReplicaResponse> stopReplica(StopReplicaRequest request) {
+            boolean isDelete = false;
+            for (PbStopReplicaReqForBucket bucket : request.getStopReplicasReqsList()) {
+                if (bucket.isDelete() && bucket.isDeleteRemote()) {
+                    isDelete = true;
+                    break;
+                }
+            }
+            if (isDelete && failDeleteTransport.get()) {
+                CompletableFuture<StopReplicaResponse> future = new CompletableFuture<>();
+                future.completeExceptionally(
+                        new NetworkException("Simulated stop replica transport failure."));
+                return future;
+            }
+            return super.stopReplica(request);
+        }
     }
 
     /**

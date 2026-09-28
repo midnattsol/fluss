@@ -25,16 +25,24 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrResponse;
 import org.apache.fluss.rpc.messages.PbNotifyLeaderAndIsrReqForBucket;
+import org.apache.fluss.rpc.messages.StopReplicaRequest;
+import org.apache.fluss.rpc.messages.StopReplicaResponse;
 import org.apache.fluss.server.coordinator.event.AccessContextEvent;
+import org.apache.fluss.server.coordinator.event.CoordinatorEvent;
+import org.apache.fluss.server.coordinator.event.DeleteReplicaResponseReceivedEvent;
 import org.apache.fluss.server.coordinator.event.EventManager;
+import org.apache.fluss.server.coordinator.event.TestingEventManager;
+import org.apache.fluss.server.entity.DeleteReplicaResultForBucket;
 import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
@@ -188,6 +196,57 @@ class CoordinatorRequestBatchTest {
         assertThat(bucketRequest.hasBucketCount()).isFalse();
         assertThat(bucketRequest.hasBucketCountEpoch()).isFalse();
         assertThat(coordinatorContext.getPendingLeaderActivationBuckets()).isEmpty();
+    }
+
+    /**
+     * A transport-level failure of a stop-replica send must feed back as failed delete results for
+     * the delete=true buckets only. Migration-style (deleteLocal=true, deleteRemote=false) sends
+     * stay best-effort and must not be routed into the deletion-success machinery.
+     */
+    @Test
+    void testStopReplicaTransportFailureEmitsDeleteFailureOnlyForDeletes() {
+        long tableId = 600L;
+        TableBucket deleteBucket = new TableBucket(tableId, 0);
+        TableBucket migrateBucket = new TableBucket(tableId, 1);
+        coordinatorContext.setLiveTabletServers(
+                CoordinatorTestUtils.createServers(Collections.singletonList(0)));
+
+        TestCoordinatorChannelManager failingChannel =
+                new TestCoordinatorChannelManager() {
+                    @Override
+                    public void sendStopBucketReplicaRequest(
+                            int receiveServerId,
+                            StopReplicaRequest stopReplicaRequest,
+                            BiConsumer<StopReplicaResponse, ? super Throwable> responseConsumer) {
+                        responseConsumer.accept(
+                                null, new NetworkException("simulated send failure for test"));
+                    }
+                };
+        TestingEventManager eventManager = new TestingEventManager();
+        CoordinatorRequestBatch batch =
+                new CoordinatorRequestBatch(failingChannel, eventManager, coordinatorContext);
+        // delete=true: replica deletion, must feed back into the deletion retry chain.
+        batch.addStopReplicaRequestForTabletServers(
+                Collections.singleton(0), deleteBucket, true, true, 0);
+        // deleteLocal=true, deleteRemote=false: replica migration, must stay best-effort.
+        batch.addStopReplicaRequestForTabletServers(
+                Collections.singleton(0), migrateBucket, true, false, 0);
+
+        batch.sendRequestToTabletServers(0);
+
+        List<DeleteReplicaResponseReceivedEvent> deleteEvents = new ArrayList<>();
+        for (CoordinatorEvent event : eventManager.getEvents()) {
+            if (event instanceof DeleteReplicaResponseReceivedEvent) {
+                deleteEvents.add((DeleteReplicaResponseReceivedEvent) event);
+            }
+        }
+        assertThat(deleteEvents).hasSize(1);
+        List<DeleteReplicaResultForBucket> results = deleteEvents.get(0).getDeleteReplicaResults();
+        assertThat(results).hasSize(1);
+        DeleteReplicaResultForBucket result = results.get(0);
+        assertThat(result.getTableBucket()).isEqualTo(deleteBucket);
+        assertThat(result.getReplica()).isEqualTo(0);
+        assertThat(result.failed()).isTrue();
     }
 
     /** Registers table metadata so normal notifications carry the bucket layout epoch. */
