@@ -34,6 +34,7 @@ import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.TooManyScannersException;
+import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.LogFormat;
@@ -53,6 +54,7 @@ import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.rpc.util.PredicateMessageUtils;
@@ -93,8 +95,10 @@ import org.apache.fluss.server.log.LogOffsetMetadata;
 import org.apache.fluss.server.log.LogOffsetSnapshot;
 import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.WriterStateManager;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.log.remote.RemoteLogStorage.IndexType;
 import org.apache.fluss.server.metadata.ServerMetadataCache;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
@@ -123,9 +127,11 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -235,6 +241,7 @@ public final class Replica {
 
     // null if table without pk or haven't become leader
     private volatile @Nullable KvTablet kvTablet;
+    private volatile boolean kvEverWrittenMarked;
     private volatile @Nullable CloseableRegistry closeableRegistryForKv;
     private @Nullable PeriodicSnapshotManager kvSnapshotManager;
 
@@ -794,6 +801,17 @@ public final class Replica {
                         i,
                         INIT_KV_TABLET_MAX_RETRY_TIMES,
                         e);
+                // A failure after loadKv leaves RocksDB open. Release it before retrying so the
+                // next download can reopen the database rather than fail on its own LOCK file.
+                if (kvTablet != null) {
+                    try {
+                        kvManager.dropKv(tableBucket);
+                        kvTablet = null;
+                    } catch (Exception cleanupError) {
+                        lastError.addSuppressed(cleanupError);
+                        break;
+                    }
+                }
             }
         }
         if (lastError != null) {
@@ -894,8 +912,24 @@ public final class Replica {
         // pinned by a lease for the whole init so that it cannot be deleted while downloading.
         // The restore below then proceeds exactly like the local-snapshot path.
         RemoteSnapshotLease remoteSnapshotLease = null;
+        boolean orphanedKvState =
+                !isHistoricalPartition()
+                        && snapshotContext.isRemoteSnapshotRestoreEnabled()
+                        && hasLocalKvState()
+                        && logTablet.localLogStartOffset() == logTablet.localLogEndOffset();
         if (!optCompletedSnapshot.isPresent()) {
             Optional<CompletedSnapshot> remoteSnapshot = tryGetLatestRemoteSnapshot();
+            checkState(
+                    !orphanedKvState || remoteSnapshot.isPresent(),
+                    "Cannot initialize %s with local KV files and no log or verifiable snapshot.",
+                    tableBucket);
+            checkState(
+                    remoteSnapshot.isPresent()
+                            || logTablet.localLogStartOffset() != logTablet.localLogEndOffset()
+                            || !snapshotContext.getZooKeeperClient().hasKvBeenWritten(tableBucket),
+                    "Cannot initialize %s with an empty log: this bucket has written data but "
+                            + "has no verifiable snapshot.",
+                    tableBucket);
             if (remoteSnapshot.isPresent()) {
                 CompletedSnapshot completedSnapshot = remoteSnapshot.get();
                 LOG.info(
@@ -910,6 +944,14 @@ public final class Replica {
                                 REMOTE_RESTORE_SNAPSHOT_LEASE_DURATION_MS);
                 optCompletedSnapshot = remoteSnapshot;
             }
+        }
+        if (optCompletedSnapshot.isPresent() && remoteSnapshotLease == null) {
+            CompletedSnapshot snapshot = optCompletedSnapshot.get();
+            remoteSnapshotLease =
+                    snapshotContext.acquireRemoteSnapshotLease(
+                            tableBucket,
+                            snapshot.getSnapshotID(),
+                            REMOTE_RESTORE_SNAPSHOT_LEASE_DURATION_MS);
         }
         try {
             Long rowCount;
@@ -933,6 +975,58 @@ public final class Replica {
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
+                // A replacement leader may have lost both its KV and its entire log. A remote
+                // snapshot is a durable base through its log offset, so an empty local log must
+                // start there too: otherwise replay reads past the log end and future writes
+                // would reuse offsets already represented by the snapshot.
+                long localLogEndOffset = logTablet.localLogEndOffset();
+                if (localLogEndOffset < restoreStartOffset) {
+                    checkState(
+                            logTablet.localLogStartOffset() == localLogEndOffset,
+                            "Cannot restore snapshot at offset %s for %s: local log ends at %s "
+                                    + "but still contains records.",
+                            restoreStartOffset,
+                            tableBucket,
+                            localLogEndOffset);
+                }
+                if (restoreStartOffset > 0
+                        && logTablet.localLogStartOffset() == localLogEndOffset
+                        && (localLogEndOffset <= restoreStartOffset
+                                || logTablet.remoteLogEndOffset() > restoreStartOffset)) {
+                    long recoverToOffset =
+                            Math.max(restoreStartOffset, logTablet.remoteLogEndOffset());
+                    byte[] writerCheckpoint =
+                            recoverToOffset > restoreStartOffset
+                                    ? downloadRemoteWriterCheckpoint(
+                                            restoreStartOffset, recoverToOffset)
+                                    : downloadSnapshotWriterCheckpoint(completedSnapshot);
+                    WriterStateManager.validateCheckpoint(writerCheckpoint);
+                    checkState(
+                            localLogEndOffset <= restoreStartOffset
+                                    || localLogEndOffset == recoverToOffset,
+                            "Cannot restore %s: empty local log at %s differs from remote end %s.",
+                            tableBucket,
+                            localLogEndOffset,
+                            recoverToOffset);
+                    if (localLogEndOffset < recoverToOffset) {
+                        // Commit the incident before mutating the log. A crash cannot subsequently
+                        // turn an incomplete snapshot restore into an unreported GREEN leader.
+                        snapshotContext
+                                .getZooKeeperClient()
+                                .recordLimitedRecovery(
+                                        tableBucket, restoreStartOffset, recoverToOffset);
+                        LOG.warn(
+                                "Restoring {} from snapshot offset {} after losing its local log"
+                                        + " (previous end {}). Verified remote log end is {}."
+                                        + " Writes beyond that end cannot be verified from this replica.",
+                                tableBucket,
+                                restoreStartOffset,
+                                localLogEndOffset,
+                                recoverToOffset);
+                        logManager.truncateFullyAndStartAt(tableBucket, recoverToOffset);
+                    }
+                    logTablet.restoreWriterCheckpoint(writerCheckpoint, recoverToOffset);
+                }
                 rowCount =
                         supportsExactRowCount(tableConfig) ? completedSnapshot.getRowCount() : null;
                 // currently, we only support one auto-increment column.
@@ -1008,6 +1102,58 @@ public final class Replica {
         return optCompletedSnapshot;
     }
 
+    private byte[] downloadSnapshotWriterCheckpoint(CompletedSnapshot snapshot) throws IOException {
+        FsPath path = snapshot.getWriterSnapshotPath();
+        checkState(
+                path != null,
+                "Cannot restore snapshot at offset %s for %s with an empty log: "
+                        + "the snapshot has no writer checkpoint.",
+                snapshot.getLogOffset(),
+                tableBucket);
+        try (FSDataInputStream input = path.getFileSystem().open(path);
+                ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            IOUtils.copyBytes(input, output, false);
+            return output.toByteArray();
+        }
+    }
+
+    private byte[] downloadRemoteWriterCheckpoint(long fromOffset, long remoteEndOffset)
+            throws Exception {
+        List<RemoteLogSegment> segments =
+                remoteLogManager.relevantRemoteLogSegments(tableBucket, fromOffset);
+        long covered = fromOffset;
+        RemoteLogSegment last = null;
+        for (RemoteLogSegment segment : segments) {
+            if (segment.logicalStartOffset() > covered) {
+                break;
+            }
+            if (segment.logicalEndOffset() > covered) {
+                covered = segment.logicalEndOffset();
+                last = segment;
+            }
+            if (covered >= remoteEndOffset) {
+                break;
+            }
+        }
+        checkState(
+                covered == remoteEndOffset
+                        && last != null
+                        && last.remoteLogEndOffset() == remoteEndOffset,
+                "Cannot restore %s: remote log from offset %s to %s is not contiguous "
+                        + "with a writer checkpoint at its end.",
+                tableBucket,
+                fromOffset,
+                remoteEndOffset);
+        try (InputStream input =
+                        remoteLogManager
+                                .getRemoteLogStorage()
+                                .fetchIndex(last, IndexType.WRITER_ID_SNAPSHOT);
+                ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            IOUtils.copyBytes(input, output, false);
+            return output.toByteArray();
+        }
+    }
+
     private void downloadKvSnapshots(CompletedSnapshot completedSnapshot, Path kvTabletDir)
             throws IOException {
         Path kvDbPath = kvTabletDir.resolve(RocksDBKvBuilder.DB_INSTANCE_DIR_STRING);
@@ -1076,25 +1222,18 @@ public final class Replica {
      * fast bootstrap of new/empty replicas share this path).
      *
      * <p>Returns empty — keeping the current restore-from-log behavior — for historical replicas,
-     * when restoring from remote snapshots is disabled, when local kv state survived (it must never
-     * be overwritten by a remote download), or when no remote snapshot can be discovered.
+     * when restoring from remote snapshots is disabled, when a nonempty local log can recover
+     * surviving KV state, or when no remote snapshot can be discovered. Unpaired local KV files on
+     * an empty log are not proof of a complete restore (a crash may leave a partial download).
      */
-    private Optional<CompletedSnapshot> tryGetLatestRemoteSnapshot() {
+    private Optional<CompletedSnapshot> tryGetLatestRemoteSnapshot() throws Exception {
         if (isHistoricalPartition()
                 || !snapshotContext.isRemoteSnapshotRestoreEnabled()
-                || hasLocalKvState()) {
+                || (hasLocalKvState()
+                        && logTablet.localLogStartOffset() != logTablet.localLogEndOffset())) {
             return Optional.empty();
         }
-        try {
-            return snapshotContext.getLatestRemoteSnapshot(physicalPath, tableBucket);
-        } catch (Exception e) {
-            LOG.warn(
-                    "Get latest remote snapshot for {} of table {} failed, will restore from log.",
-                    tableBucket,
-                    physicalPath,
-                    e);
-            return Optional.empty();
-        }
+        return snapshotContext.getLatestRemoteSnapshot(physicalPath, tableBucket);
     }
 
     /**
@@ -1255,6 +1394,8 @@ public final class Replica {
                             coordinatorEpochSupplier,
                             lastCompletedSnapshotLogOffset,
                             snapshotSize);
+            kvTabletSnapshotTarget.setWriterCheckpointProvider(logTablet::pinWriterCheckpoint);
+            kvTabletSnapshotTarget.setWriterCheckpointCache(logTablet::cacheKvWriterCheckpoint);
             this.kvSnapshotManager =
                     PeriodicSnapshotManager.create(
                             tableBucket,
@@ -1366,6 +1507,10 @@ public final class Replica {
                     KvTablet kv = this.kvTablet;
                     checkNotNull(
                             kv, "KvTablet for the replica to put kv records shouldn't be null.");
+                    if (!kvEverWrittenMarked) {
+                        snapshotContext.getZooKeeperClient().markKvWritten(tableBucket);
+                        kvEverWrittenMarked = true;
+                    }
                     LogAppendInfo logAppendInfo;
                     try {
                         logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);

@@ -24,6 +24,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
+import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.json.JsonDeserializer;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.json.JsonSerializer;
@@ -177,6 +178,33 @@ public class WriterStateManager {
         lastMapOffset = offset;
     }
 
+    /** Install the writer checkpoint paired with a restored KV snapshot at the same log offset. */
+    public void restoreSnapshotAtOffset(byte[] checkpoint, long offset, long currentTimeMs)
+            throws IOException {
+        validateCheckpoint(checkpoint);
+        File snapshotFile = writerSnapshotFile(logTabletDir, offset);
+        File pending = new File(snapshotFile.getPath() + ".restoring");
+        try {
+            Files.write(pending.toPath(), checkpoint);
+            // Validate before publishing: a corrupt checkpoint must not become a local snapshot.
+            readSnapshot(pending);
+            FileUtils.atomicMoveWithFallback(pending.toPath(), snapshotFile.toPath(), false);
+            reloadSnapshots();
+            clearWriterIds();
+            loadFromSnapshot(0L, currentTimeMs);
+        } finally {
+            Files.deleteIfExists(pending.toPath());
+        }
+    }
+
+    public static void validateCheckpoint(byte[] checkpoint) throws IOException {
+        try {
+            WriterSnapshotMap.fromJsonBytes(checkpoint);
+        } catch (RuntimeException e) {
+            throw new IOException("Invalid writer checkpoint", e);
+        }
+    }
+
     public void reloadSnapshots() throws IOException {
         LOG.info("Reloading the writer state snapshots");
         snapshots = loadSnapshots();
@@ -226,6 +254,12 @@ public class WriterStateManager {
     /** Fetch the snapshot file for the end offset of the log segment. */
     public Optional<File> fetchSnapshot(long offset) {
         return Optional.ofNullable(snapshots.get(offset)).map(SnapshotFile::file);
+    }
+
+    /** A checkpoint no newer than the requested KV offset, for independent writer replay. */
+    public Optional<Long> latestSnapshotAtOrBefore(long offset) {
+        Map.Entry<Long, SnapshotFile> entry = snapshots.floorEntry(offset);
+        return entry == null ? Optional.empty() : Optional.of(entry.getKey());
     }
 
     public WriterAppendInfo prepareUpdate(long writerId) {

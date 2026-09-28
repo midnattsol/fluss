@@ -1494,6 +1494,38 @@ public class ZooKeeperClient implements AutoCloseable {
     // Writer
     // --------------------------------------------------------------------------------------------
 
+    /** Record a durable, latched incident before activating a recovered empty-log leader. */
+    public void recordLimitedRecovery(TableBucket tableBucket, long snapshotOffset, long logEnd)
+            throws Exception {
+        String path = ZkData.LimitedRecoveryZNode.path(tableBucket);
+        byte[] evidence =
+                ("snapshotOffset=" + snapshotOffset + ",remoteLogEnd=" + logEnd)
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        try {
+            zkClient.create().creatingParentsIfNeeded().forPath(path, evidence);
+        } catch (KeeperException.NodeExistsException ignored) {
+            // Keep the first incident until the operator explicitly resolves it.
+        }
+    }
+
+    public boolean hasLimitedRecovery() throws Exception {
+        return zkClient.checkExists().forPath(ZkData.LimitedRecoveryZNode.root()) != null;
+    }
+
+    public void markKvWritten(TableBucket tableBucket) throws Exception {
+        try {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .forPath(ZkData.KvEverWrittenZNode.path(tableBucket));
+        } catch (KeeperException.NodeExistsException ignored) {
+            // The marker survives leadership and disk replacement.
+        }
+    }
+
+    public boolean hasKvBeenWritten(TableBucket tableBucket) throws Exception {
+        return zkClient.checkExists().forPath(ZkData.KvEverWrittenZNode.path(tableBucket)) != null;
+    }
+
     /** generate an unique id for writer. */
     public long getWriterIdAndIncrement() throws Exception {
         return writerIdCounter.getAndIncrement();

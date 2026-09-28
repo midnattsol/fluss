@@ -64,6 +64,10 @@ public class SnapshotRunner {
         return new AsyncSnapshotCallable<SnapshotResult>() {
             @Override
             protected SnapshotResult callInternal() throws Exception {
+                snapshotLocation
+                        .getSnapshotDirectory()
+                        .getFileSystem()
+                        .mkdirs(snapshotLocation.getSnapshotDirectory());
                 return asyncSnapshot.get(snapshotCloseableRegistry);
             }
 

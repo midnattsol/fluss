@@ -58,6 +58,9 @@ pub struct ClusterHealth {
     pub num_leader_replicas: i32,
     pub active_leader_replicas: i32,
     pub status: ClusterHealthStatus,
+    /// Persistent evidence of a snapshot-based recovery with an unverified tail.
+    /// `None` means the server predates this field; it is not proof of safety.
+    pub data_at_risk: Option<bool>,
 }
 
 impl ClusterHealth {
@@ -68,6 +71,7 @@ impl ClusterHealth {
             num_leader_replicas: pb.num_leader_replicas,
             active_leader_replicas: pb.active_leader_replicas,
             status: ClusterHealthStatus::try_from_i32(pb.status)?,
+            data_at_risk: pb.data_at_risk,
         })
     }
 }
@@ -101,9 +105,11 @@ mod tests {
             num_leader_replicas: 3,
             active_leader_replicas: 3,
             status: 1,
+            data_at_risk: Some(true),
         };
         let h = ClusterHealth::from_pb(&pb).unwrap();
         assert_eq!(h.num_replicas, 5);
         assert_eq!(h.status, ClusterHealthStatus::Yellow);
+        assert_eq!(h.data_at_risk, Some(true));
     }
 }

@@ -94,6 +94,41 @@ class CompletedSnapshotTest {
     }
 
     @Test
+    void testWriterCheckpointIsRemovedWithSnapshot(@TempDir Path tempDir) throws Exception {
+        Path localDir = makeDir(tempDir, "local");
+        Path remoteDir = makeDir(tempDir, "remote");
+        Path sharedDir = makeDir(remoteDir, "shared");
+        Path snapshotDir = makeDir(remoteDir, "snapshot-1");
+        Path writerPath = Files.write(snapshotDir.resolve("_WRITER_STATE"), new byte[] {1});
+        KvSnapshotHandle handle = makeSnapshotHandle(localDir, snapshotDir, sharedDir, 100);
+        CompletedSnapshot snapshot =
+                new CompletedSnapshot(
+                        new TableBucket(1, 1),
+                        1,
+                        FsPath.fromLocalFile(snapshotDir.toFile()),
+                        handle,
+                        5,
+                        null,
+                        null,
+                        FsPath.fromLocalFile(writerPath.toFile()));
+        Files.createFile(snapshotDir.resolve("_METADATA"));
+        snapshot.registerSharedKvFilesAfterRestored(new SharedKvFileRegistry());
+
+        snapshot.discardAsync(Executors.directExecutor()).get();
+        assertThat(Files.exists(snapshotDir)).isFalse();
+        assertThat(Files.exists(writerPath)).isFalse();
+        assertThat(
+                        Files.exists(
+                                new File(
+                                                handle.getSharedKvFileHandles()
+                                                        .get(0)
+                                                        .getKvFileHandle()
+                                                        .getFilePath())
+                                        .toPath()))
+                .isTrue();
+    }
+
+    @Test
     void testKvSnapshotSize(@TempDir Path tempDir) throws Exception {
         // create base directory for snapshot
         TableBucket tableBucket = new TableBucket(1, 1);

@@ -1102,6 +1102,9 @@ pub struct GetClusterHealthResponse {
     /// PbClusterHealthStatus: GREEN=0, YELLOW=1, RED=2, UNKNOWN=3
     #[prost(int32, required, tag = "5")]
     pub status: i32,
+    /// persistent snapshot-only disaster recovery evidence
+    #[prost(bool, optional, tag = "6")]
+    pub data_at_risk: ::core::option::Option<bool>,
 }
 /// Per-server health slice for Admin.describeTabletServers (see FIP-41):
 /// the same four counters getClusterHealth reports cluster-wide, scoped to

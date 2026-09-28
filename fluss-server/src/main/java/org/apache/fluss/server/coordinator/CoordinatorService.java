@@ -1688,8 +1688,17 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
         }
 
+        final boolean dataAtRisk;
+        try {
+            dataAtRisk = zkClient.hasLimitedRecovery();
+        } catch (Exception e) {
+            CompletableFuture<GetClusterHealthResponse> failure = new CompletableFuture<>();
+            failure.completeExceptionally(e);
+            return failure;
+        }
         AccessContextEvent<GetClusterHealthResponse> event =
-                new AccessContextEvent<>(CoordinatorService::computeClusterHealth);
+                new AccessContextEvent<>(
+                        ctx -> computeClusterHealth(ctx).setDataAtRisk(dataAtRisk));
         eventManagerSupplier.get().put(event);
         return event.getResultFuture();
     }

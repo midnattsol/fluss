@@ -17,11 +17,16 @@
 
 package org.apache.fluss.server.replica;
 
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableBucketSnapshot;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordTestUtils.KvRecordBatchFactory;
+import org.apache.fluss.remote.RemoteLogManifest;
+import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
@@ -41,6 +46,8 @@ import org.apache.fluss.server.kv.snapshot.RemoteSnapshotLease;
 import org.apache.fluss.server.kv.snapshot.SnapshotContext;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.LogAppendInfo;
+import org.apache.fluss.server.log.LogSegment;
+import org.apache.fluss.server.log.remote.LogSegmentFiles;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
@@ -67,6 +74,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -77,6 +85,7 @@ import java.util.stream.Collectors;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
+import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.kv.KvTabletTestUtils.flushAndWait;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
@@ -84,6 +93,7 @@ import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
 import static org.apache.fluss.testutils.DataTestUtils.genKvRecords;
 import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for restoring an empty kv replica from a remote snapshot.
@@ -96,6 +106,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
 
     private static final TableBucket TABLE_BUCKET = new TableBucket(DATA1_TABLE_ID_PK, 1);
+
+    @Override
+    protected Configuration getServerConf() {
+        Configuration config = super.getServerConf();
+        config.set(ConfigOptions.REMOTE_LOG_TASK_INTERVAL_DURATION, Duration.ofHours(1));
+        return config;
+    }
 
     @Test
     void testRestoreFromRemoteSnapshot(@TempDir File remoteDir) throws Exception {
@@ -119,6 +136,314 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
                                 new Object[] {2, "b"},
                                 new Object[] {3, "c"}));
         assertHasKeyValues(restored.getKvTablet(), expectedKeyValues);
+    }
+
+    @Test
+    void testRestoreFromRemoteSnapshotWithEmptyLocalLog(@TempDir File remoteDir) throws Exception {
+        RemoteRestoreSnapshotContext context = new RemoteRestoreSnapshotContext(remoteDir);
+        CompletedSnapshot remoteSnapshot = writeDataAndTakeSnapshot(context);
+        wipeLocalKvState(context.replica);
+        // Model a lost disk: the restored log starts at zero, while the remote snapshot already
+        // contains the acknowledged records up to its log offset.
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+        assertThat(context.replica.getLocalLogEndOffset()).isZero();
+        assertThat(remoteSnapshot.getLogOffset()).isPositive();
+
+        RemoteRestoreSnapshotContext freshContext = new RemoteRestoreSnapshotContext(remoteDir);
+        freshContext.remoteSnapshotStore.commitKvSnapshot(remoteSnapshot, 0, 0);
+        Replica restored = makeFreshLeader(freshContext);
+
+        assertThat(freshContext.downloadEvents).containsExactly("download");
+        assertThat(restored.getLocalLogEndOffset()).isEqualTo(remoteSnapshot.getLogOffset());
+        assertThat(zkClient.hasLimitedRecovery()).isTrue();
+        assertHasKeyValues(
+                restored.getKvTablet(),
+                getKeyValuePairs(genKvRecords(new Object[] {1, "a"}, new Object[] {2, "b"})));
+        putRecordsToLeader(restored, genKvRecordBatch(new Object[] {3, "c"}));
+        assertHasKeyValues(
+                restored.getKvTablet(),
+                getKeyValuePairs(
+                        genKvRecords(
+                                new Object[] {1, "a"},
+                                new Object[] {2, "b"},
+                                new Object[] {3, "c"})));
+    }
+
+    @Test
+    void testFailedRestoreClosesKvBeforeRetry(@TempDir File remoteDir) throws Exception {
+        RemoteRestoreSnapshotContext context = new RemoteRestoreSnapshotContext(remoteDir);
+        CompletedSnapshot remoteSnapshot = writeDataAndTakeSnapshot(context);
+        wipeLocalKvState(context.replica);
+        // A nonempty log ending before the snapshot offset is inconsistent: fail closed, but
+        // retry without retaining RocksDB's LOCK from the previous attempt.
+        logManager.truncateTo(TABLE_BUCKET, remoteSnapshot.getLogOffset() - 1);
+
+        RemoteRestoreSnapshotContext freshContext = new RemoteRestoreSnapshotContext(remoteDir);
+        freshContext.remoteSnapshotStore.commitKvSnapshot(remoteSnapshot, 0, 0);
+        assertThatThrownBy(() -> makeFreshLeader(freshContext))
+                .hasRootCauseMessage(
+                        String.format(
+                                "Cannot restore snapshot at offset %s for %s: local log ends at %s but still contains records.",
+                                remoteSnapshot.getLogOffset(),
+                                TABLE_BUCKET,
+                                remoteSnapshot.getLogOffset() - 1));
+        assertThat(freshContext.downloadEvents).hasSize(5);
+        assertThat(kvManager.getKv(TABLE_BUCKET)).isEmpty();
+    }
+
+    @Test
+    void testRestoredWriterCanContinueAfterLogLoss(@TempDir File remoteDir) throws Exception {
+        RemoteRestoreSnapshotContext context = new RemoteRestoreSnapshotContext(remoteDir);
+        Replica original = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET, context);
+        makeKvReplicaAsLeader(original, INITIAL_LEADER_EPOCH);
+        KvRecordBatchFactory batches = KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
+        putRecordsToLeader(
+                original, batches.ofRecords(genKvRecords(new Object[] {1, "a"}), 77L, 0));
+        context.scheduledExecutorService.triggerAllNonPeriodicTasks();
+        CompletedSnapshot snapshot =
+                context.testKvSnapshotStore.waitUntilSnapshotComplete(TABLE_BUCKET, 0);
+        assertThat(snapshot.getWriterSnapshotPath()).isNotNull();
+        wipeLocalKvState(original);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+
+        RemoteRestoreSnapshotContext fresh = new RemoteRestoreSnapshotContext(remoteDir);
+        fresh.remoteSnapshotStore.commitKvSnapshot(snapshot, 0, 0);
+        Replica restored = makeFreshLeader(fresh);
+        assertThat(restored.getLogTablet().activeWriters()).containsKey(77L);
+        LogAppendInfo duplicate =
+                putRecordsToLeader(
+                        restored, batches.ofRecords(genKvRecords(new Object[] {1, "a"}), 77L, 0));
+        assertThat(duplicate.duplicated()).isTrue();
+        putRecordsToLeader(
+                restored, batches.ofRecords(genKvRecords(new Object[] {2, "b"}), 77L, 1));
+        assertHasKeyValues(
+                restored.getKvTablet(),
+                getKeyValuePairs(genKvRecords(new Object[] {1, "a"}, new Object[] {2, "b"})));
+    }
+
+    @Test
+    void testSnapshotCapturesWritersAtFlushedOffsetWhileLogIsAhead(@TempDir File remoteDir)
+            throws Exception {
+        RemoteRestoreSnapshotContext context = new RemoteRestoreSnapshotContext(remoteDir);
+        Replica original = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET, context);
+        makeKvReplicaAsLeader(original, INITIAL_LEADER_EPOCH);
+        KvRecordBatchFactory batches = KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
+        putRecordsToLeader(
+                original, batches.ofRecords(genKvRecords(new Object[] {1, "a"}), 77L, 0));
+        long flushedOffset = original.getKvTablet().getFlushedLogOffset();
+        // The next WAL batch is accepted locally, but not flushed into the KV snapshot.
+        original.putRecordsToLeader(
+                batches.ofRecords(genKvRecords(new Object[] {2, "b"}), 77L, 1),
+                null,
+                MergeMode.DEFAULT,
+                0);
+        assertThat(original.getLocalLogEndOffset()).isGreaterThan(flushedOffset);
+        context.scheduledExecutorService.triggerAllNonPeriodicTasks();
+        CompletedSnapshot snapshot =
+                context.testKvSnapshotStore.waitUntilSnapshotComplete(TABLE_BUCKET, 0);
+        assertThat(snapshot.getLogOffset()).isEqualTo(flushedOffset);
+        assertThat(snapshot.getWriterSnapshotPath()).isNotNull();
+
+        wipeLocalKvState(original);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+        RemoteRestoreSnapshotContext fresh = new RemoteRestoreSnapshotContext(remoteDir);
+        fresh.remoteSnapshotStore.commitKvSnapshot(snapshot, 0, 0);
+        Replica restored = makeFreshLeader(fresh);
+        putRecordsToLeader(
+                restored, batches.ofRecords(genKvRecords(new Object[] {2, "b"}), 77L, 1));
+        assertHasKeyValues(
+                restored.getKvTablet(),
+                getKeyValuePairs(genKvRecords(new Object[] {1, "a"}, new Object[] {2, "b"})));
+    }
+
+    @Test
+    void testRemoteLogTailReplayedAfterTotalLocalLoss(@TempDir File remoteDir) throws Exception {
+        RemoteRestoreSnapshotContext originalContext = new RemoteRestoreSnapshotContext(remoteDir);
+        Replica original =
+                makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET, originalContext);
+        makeKvReplicaAsLeader(original, INITIAL_LEADER_EPOCH);
+        KvRecordBatchFactory batches = KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
+        putRecordsToLeader(
+                original, batches.ofRecords(genKvRecords(new Object[] {1, "a"}), 77L, 0));
+        originalContext.scheduledExecutorService.triggerAllNonPeriodicTasks();
+        CompletedSnapshot snapshot =
+                originalContext.testKvSnapshotStore.waitUntilSnapshotComplete(TABLE_BUCKET, 0);
+        putRecordsToLeader(
+                original, batches.ofRecords(genKvRecords(new Object[] {2, "b"}), 77L, 1));
+        long remoteEnd = original.getLocalLogEndOffset();
+        original.getLogTablet().roll(Optional.empty());
+        List<LogSegment> localSegments = original.getLogTablet().getSegments();
+        LogSegment segment = localSegments.get(0);
+        File writerSnapshot =
+                original.getLogTablet().writerStateManager().fetchSnapshot(remoteEnd).get();
+        RemoteLogSegment remoteSegment =
+                RemoteLogSegment.Builder.builder()
+                        .remoteLogSegmentId(UUID.randomUUID())
+                        .remoteLogStartOffset(0L)
+                        .remoteLogEndOffset(remoteEnd)
+                        .maxTimestamp(segment.maxTimestampSoFar())
+                        .segmentSizeInBytes(segment.getFileLogRecords().sizeInBytes())
+                        .tableBucket(TABLE_BUCKET)
+                        .physicalTablePath(DATA1_PHYSICAL_TABLE_PATH_PK)
+                        .build();
+        remoteLogStorage.copyLogSegmentFiles(
+                remoteSegment,
+                new LogSegmentFiles(
+                        segment.getFileLogRecords().file().toPath(),
+                        segment.offsetIndex().file().toPath(),
+                        segment.timeIndex().file().toPath(),
+                        writerSnapshot.toPath()));
+        remoteLogManager.registerReplica(original);
+        remoteLogManager
+                .remoteLogTablet(TABLE_BUCKET)
+                .loadRemoteLogManifest(
+                        new RemoteLogManifest(
+                                DATA1_PHYSICAL_TABLE_PATH_PK,
+                                TABLE_BUCKET,
+                                Collections.singletonList(remoteSegment)));
+        original.getLogTablet().updateRemoteLogOffsets(0L, remoteEnd, remoteEnd);
+
+        wipeLocalKvState(original);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+        RemoteRestoreSnapshotContext freshContext = new RemoteRestoreSnapshotContext(remoteDir);
+        freshContext.remoteSnapshotStore.commitKvSnapshot(snapshot, 0, 0);
+        Replica restored = makeFreshLeader(freshContext);
+
+        assertThat(restored.getLocalLogEndOffset()).isEqualTo(remoteEnd);
+        assertHasKeyValues(
+                restored.getKvTablet(),
+                getKeyValuePairs(genKvRecords(new Object[] {1, "a"}, new Object[] {2, "b"})));
+        putRecordsToLeader(
+                restored, batches.ofRecords(genKvRecords(new Object[] {3, "c"}), 77L, 2));
+        assertHasKeyValues(
+                restored.getKvTablet(),
+                getKeyValuePairs(
+                        genKvRecords(
+                                new Object[] {1, "a"},
+                                new Object[] {2, "b"},
+                                new Object[] {3, "c"})));
+    }
+
+    @Test
+    void testSnapshotWithoutWriterCheckpointFailsClosedOnEmptyLog(@TempDir File remoteDir)
+            throws Exception {
+        RemoteRestoreSnapshotContext original = new RemoteRestoreSnapshotContext(remoteDir);
+        CompletedSnapshot snapshot = writeDataAndTakeSnapshot(original);
+        wipeLocalKvState(original.replica);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+        CompletedSnapshot legacy =
+                new CompletedSnapshot(
+                        snapshot.getTableBucket(),
+                        snapshot.getSnapshotID(),
+                        snapshot.getSnapshotLocation(),
+                        snapshot.getKvSnapshotHandle(),
+                        snapshot.getLogOffset(),
+                        snapshot.getRowCount(),
+                        snapshot.getAutoIncIDRanges());
+        RemoteRestoreSnapshotContext fresh = new RemoteRestoreSnapshotContext(remoteDir);
+        fresh.remoteSnapshotStore.commitKvSnapshot(legacy, 0, 0);
+        assertThatThrownBy(() -> makeFreshLeader(fresh))
+                .hasRootCauseMessage(
+                        String.format(
+                                "Cannot restore snapshot at offset %s for %s with an empty log: the snapshot has no writer checkpoint.",
+                                snapshot.getLogOffset(), TABLE_BUCKET));
+        assertThat(kvManager.getKv(TABLE_BUCKET)).isEmpty();
+    }
+
+    @Test
+    void testRemoteDiscoveryFailureDoesNotStartEmptyLeader(@TempDir File remoteDir)
+            throws Exception {
+        RemoteRestoreSnapshotContext original = new RemoteRestoreSnapshotContext(remoteDir);
+        writeDataAndTakeSnapshot(original);
+        wipeLocalKvState(original.replica);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+
+        RemoteRestoreSnapshotContext fresh = new RemoteRestoreSnapshotContext(remoteDir);
+        fresh.failRemoteDiscovery = true;
+        assertThatThrownBy(() -> makeFreshLeader(fresh))
+                .hasRootCauseMessage("remote storage unavailable");
+        assertThat(kvManager.getKv(TABLE_BUCKET)).isEmpty();
+    }
+
+    @Test
+    void testWrittenBucketWithoutSnapshotCannotReturnEmpty(@TempDir File remoteDir)
+            throws Exception {
+        RemoteRestoreSnapshotContext original = new RemoteRestoreSnapshotContext(remoteDir);
+        writeDataAndTakeSnapshot(original);
+        wipeLocalKvState(original.replica);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+
+        RemoteRestoreSnapshotContext fresh = new RemoteRestoreSnapshotContext(remoteDir);
+        assertThatThrownBy(() -> makeFreshLeader(fresh))
+                .hasRootCauseMessage(
+                        String.format(
+                                "Cannot initialize %s with an empty log: this bucket has written data but has no verifiable snapshot.",
+                                TABLE_BUCKET));
+        assertThat(original.replica.getLocalLogEndOffset()).isZero();
+    }
+
+    @Test
+    void testKnownRemoteLogTailMustNotBeDiscarded(@TempDir File remoteDir) throws Exception {
+        RemoteRestoreSnapshotContext original = new RemoteRestoreSnapshotContext(remoteDir);
+        CompletedSnapshot snapshot = writeDataAndTakeSnapshot(original);
+        wipeLocalKvState(original.replica);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+        original.replica
+                .getLogTablet()
+                .updateRemoteLogOffsets(
+                        0, snapshot.getLogOffset() + 1, snapshot.getLogOffset() + 1);
+
+        RemoteRestoreSnapshotContext fresh = new RemoteRestoreSnapshotContext(remoteDir);
+        fresh.remoteSnapshotStore.commitKvSnapshot(snapshot, 0, 0);
+        assertThatThrownBy(() -> makeFreshLeader(fresh))
+                .hasMessageContaining("Failed to create KV tablet");
+        assertThat(kvManager.getKv(TABLE_BUCKET)).isEmpty();
+        assertThat(original.replica.getLocalLogEndOffset()).isZero();
+    }
+
+    @Test
+    void testOrphanedKvFilesOnEmptyLogAreNotTrusted(@TempDir File remoteDir) throws Exception {
+        RemoteRestoreSnapshotContext original = new RemoteRestoreSnapshotContext(remoteDir);
+        CompletedSnapshot snapshot = writeDataAndTakeSnapshot(original);
+        wipeLocalKvState(original.replica);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+        File kvDir =
+                FlussPaths.kvTabletDir(
+                        original.replica.getLogTablet().getDataDir(),
+                        DATA1_PHYSICAL_TABLE_PATH_PK,
+                        TABLE_BUCKET);
+        Files.createDirectories(kvDir.toPath());
+        Files.write(new File(kvDir, "partial-download").toPath(), new byte[] {1});
+
+        RemoteRestoreSnapshotContext fresh = new RemoteRestoreSnapshotContext(remoteDir);
+        assertThatThrownBy(() -> makeFreshLeader(fresh))
+                .hasRootCauseMessage(
+                        String.format(
+                                "Cannot initialize %s with local KV files and no log or verifiable snapshot.",
+                                TABLE_BUCKET));
+
+        fresh.remoteSnapshotStore.commitKvSnapshot(snapshot, 0, 0);
+        Replica restored = makeFreshLeader(fresh);
+        assertHasKeyValues(
+                restored.getKvTablet(),
+                getKeyValuePairs(genKvRecords(new Object[] {1, "a"}, new Object[] {2, "b"})));
+    }
+
+    @Test
+    void testCorruptWriterCheckpointDoesNotAdvanceLog(@TempDir File remoteDir) throws Exception {
+        RemoteRestoreSnapshotContext original = new RemoteRestoreSnapshotContext(remoteDir);
+        CompletedSnapshot snapshot = writeDataAndTakeSnapshot(original);
+        wipeLocalKvState(original.replica);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+        Files.write(
+                new File(snapshot.getWriterSnapshotPath().toString()).toPath(),
+                new byte[] {1, 2, 3});
+
+        RemoteRestoreSnapshotContext fresh = new RemoteRestoreSnapshotContext(remoteDir);
+        fresh.remoteSnapshotStore.commitKvSnapshot(snapshot, 0, 0);
+        assertThatThrownBy(() -> makeFreshLeader(fresh))
+                .hasStackTraceContaining("Invalid writer checkpoint");
+        assertThat(original.replica.getLocalLogEndOffset()).isZero();
     }
 
     @Test
@@ -148,6 +473,24 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         assertThat(freshContext.orderedEvents)
                 .containsExactly("acquire:" + snapshotId, "download", "release:" + snapshotId);
         assertThat(freshContext.activeLeases.get()).isEqualTo(0);
+    }
+
+    @Test
+    void testSnapshotDiscoveredThroughHandleIsAlsoLeased(@TempDir File remoteDir) throws Exception {
+        RemoteRestoreSnapshotContext original = new RemoteRestoreSnapshotContext(remoteDir);
+        CompletedSnapshot snapshot = writeDataAndTakeSnapshot(original);
+        wipeLocalKvState(original.replica);
+        logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
+
+        RemoteRestoreSnapshotContext fresh = new RemoteRestoreSnapshotContext(remoteDir);
+        fresh.testKvSnapshotStore.commitKvSnapshot(snapshot, 0, 0);
+        Replica restored = makeFreshLeader(fresh);
+        assertThat(fresh.orderedEvents)
+                .containsExactly(
+                        "acquire:" + snapshot.getSnapshotID(),
+                        "download",
+                        "release:" + snapshot.getSnapshotID());
+        assertThat(restored.getKvTablet()).isNotNull();
     }
 
     @Test
@@ -501,6 +844,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         private final List<String> downloadEvents = new ArrayList<>();
         private final AtomicInteger activeLeases = new AtomicInteger(0);
         private boolean remoteRestoreEnabled = true;
+        private boolean failRemoteDiscovery;
         private Replica replica;
 
         RemoteRestoreSnapshotContext(File remoteDir) throws Exception {
@@ -514,7 +858,10 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
 
         @Override
         public Optional<CompletedSnapshot> getLatestRemoteSnapshot(
-                PhysicalTablePath physicalPath, TableBucket tableBucket) {
+                PhysicalTablePath physicalPath, TableBucket tableBucket) throws Exception {
+            if (failRemoteDiscovery) {
+                throw new IOException("remote storage unavailable");
+            }
             return Optional.ofNullable(remoteSnapshotStore.getLatestCompletedSnapshot(tableBucket));
         }
 
