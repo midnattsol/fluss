@@ -356,12 +356,9 @@ class TableManagerTest {
         // the retry re-sent stopReplica(delete=true), which now succeeds
         dispatchDeleteReplicaEvents();
 
-        // all replicas must now be deletion-successful ...
-        for (TableBucketReplica replica : replicas) {
-            assertThat(coordinatorContext.getReplicaState(replica))
-                    .isEqualTo(ReplicaDeletionSuccessful);
-        }
-        // ... and the table deletion completes: ZK assignment gone, context cleaned up
+        // completion already wiped per-replica states (completeDeleteTable runs inside
+        // resumeDeletions once all replicas are successful), so the retry is proven
+        // through its effects: ZK assignment gone, context cleaned up.
         retry(
                 Duration.ofSeconds(30),
                 () -> assertThat(zookeeperClient.getTableAssignment(tableId)).isEmpty());
