@@ -1,8 +1,10 @@
 # Fork-only release images. Lives on develop, never merges upstream:
 # keep it out of feature branches aimed at apache/fluss.
 #
-# Publishes ghcr.io/midnattsol/fluss:<tag> where <tag> is 1.0.0-midnattsol.N
+# Publishes ghcr.io/midnattsol/fluss:<tag> and
+# ghcr.io/midnattsol/fluss-gateway:<tag> where <tag> is 1.0.0-midnattsol.N
 # (Upstream 1.0.0 base plus fork patches; hyphen keeps the tag Docker-valid).
+# One release tag publishes both images in lockstep: no version matrix.
 name: Fork server image
 
 on:
@@ -70,3 +72,90 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.tag.outputs.value }}
             org.opencontainers.image.source=https://github.com/midnattsol/fluss
+
+  gateway-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork develop
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: fluss-gateway
+
+      # Same gates as gateway-ci (build + tests + OpenAPI drift), so a
+      # published image never trails failing code. Toolchain comes from
+      # rust-toolchain.toml, like CI — no floating stable.
+      - name: Unit and Integration Tests
+        working-directory: fluss-gateway
+        run: cargo test --locked --all-targets
+        env:
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+
+      - name: OpenAPI drift check
+        working-directory: fluss-gateway
+        run: |
+          cargo test --locked --lib protocol::rest::openapi::tests::export_checked_in_document -- --ignored --exact
+          git diff --exit-code openapi.yaml
+
+      # Same invocation shape as docker/fluss-gateway/build.sh (which cds
+      # into tools/ because the script resolves paths relatively): release
+      # script first, staging second.
+      - name: Build release distribution
+        working-directory: tools
+        env:
+          RELEASE_VERSION: ${{ steps.tag.outputs.value }}
+          GATEWAY_ARCH: amd64
+          GATEWAY_RELEASE_DIR: ${{ github.workspace }}/gateway-release
+          SKIP_GPG: true
+        run: ./releasing/create_gateway_release.sh
+
+      - name: Stage build output for Docker
+        env:
+          RELEASE_VERSION: ${{ steps.tag.outputs.value }}
+          GATEWAY_ARCHES: amd64
+          GATEWAY_RELEASE_DIR: ${{ github.workspace }}/gateway-release
+          GATEWAY_IMAGE_BUILD_DIR: ${{ github.workspace }}/docker/fluss-gateway/build-target
+          SKIP_GPG: true
+        run: ./docker/fluss-gateway/prepare_build.sh
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/fluss-gateway
+          push: true
+          build-args: |
+            FLUSS_VERSION=${{ steps.tag.outputs.value }}
+            VCS_REF=${{ github.sha }}
+          tags: |
+            ghcr.io/midnattsol/fluss-gateway:${{ steps.tag.outputs.value }}
+            ghcr.io/midnattsol/fluss-gateway:1.0.0-midnattsol-latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.value }}
+            org.opencontainers.image.source=https://github.com/midnattsol/fluss
+
+      # Self-contained smoke (health/ready/metrics endpoints plus uid, no
+      # Fluss needed): runs against the just-published image.
+      - name: Smoke-test published image
+        env:
+          GATEWAY_IMAGE: ghcr.io/midnattsol/fluss-gateway:${{ steps.tag.outputs.value }}
+        run: ./docker/fluss-gateway/smoke-test.sh
