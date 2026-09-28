@@ -23,8 +23,8 @@ use crate::backend::{FlussBackend, RowWriteError, WriteRequest, WriteResult, unk
 use crate::error::{GatewayError, GatewayResult, Resource};
 use async_trait::async_trait;
 use fluss::metadata::{
-    AlterTableChanges, DataType, PartitionInfo, PartitionSpec, Schema, TableDescriptor, TableInfo,
-    TablePath,
+    AlterTableChanges, ClusterHealth, ClusterHealthStatus, DataType, PartitionInfo, PartitionSpec,
+    Schema, TableDescriptor, TableInfo, TablePath,
 };
 use std::collections::{BTreeMap, HashMap, btree_map::Entry};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -36,13 +36,33 @@ struct FakeTable {
     partitions: Vec<PartitionInfo>,
 }
 
-#[derive(Default)]
 struct FakeState {
     databases: BTreeMap<String, BTreeMap<String, FakeTable>>,
     calls: Vec<FakeCall>,
     failures: HashMap<Operation, GatewayError>,
     writes: Vec<Option<Vec<String>>>,
     write_failures: Vec<(usize, GatewayError)>,
+    cluster_health: ClusterHealth,
+}
+
+impl Default for FakeState {
+    fn default() -> Self {
+        Self {
+            databases: BTreeMap::new(),
+            calls: Vec::new(),
+            failures: HashMap::new(),
+            writes: Vec::new(),
+            write_failures: Vec::new(),
+            // Fixtures start writable: admission tests set a non-GREEN status explicitly.
+            cluster_health: ClusterHealth {
+                num_replicas: 1,
+                in_sync_replicas: 1,
+                num_leader_replicas: 1,
+                active_leader_replicas: 1,
+                status: ClusterHealthStatus::Green,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,6 +78,7 @@ pub enum Operation {
     ListPartitions,
     CreatePartition,
     DropPartition,
+    ClusterHealth,
     Write,
 }
 
@@ -139,6 +160,11 @@ impl FakeFlussBackend {
 
     pub fn fail_rows(&self, failures: Vec<(usize, GatewayError)>) {
         self.state().write_failures = failures;
+    }
+
+    /// Reports this health from `cluster_health`, so admission tests can make the fixture unwritable.
+    pub fn set_cluster_health(&self, health: ClusterHealth) {
+        self.state().cluster_health = health;
     }
 
     pub fn writes(&self) -> Vec<Option<Vec<String>>> {
@@ -430,6 +456,12 @@ impl FlussBackend for FakeFlussBackend {
             Some(FakeCall::DropPartition(table.clone(), spec.clone())),
             |_| Ok(()),
         )
+    }
+
+    async fn cluster_health(&self, ctx: &RequestContext) -> GatewayResult<ClusterHealth> {
+        self.call(ctx, Operation::ClusterHealth, None, |state| {
+            Ok(state.cluster_health.clone())
+        })
     }
 
     async fn write(
