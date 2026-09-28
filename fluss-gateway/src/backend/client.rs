@@ -32,8 +32,8 @@ use fluss::client::{
 };
 use fluss::error::{Error as FlussClientError, FlussError};
 use fluss::metadata::{
-    AlterTableChanges, PartitionInfo, PartitionSpec, PhysicalTablePath, TableDescriptor, TableInfo,
-    TablePath,
+    AlterTableChanges, ClusterHealth, PartitionInfo, PartitionSpec, PhysicalTablePath,
+    TableDescriptor, TableInfo, TablePath,
 };
 use fluss::record::ChangeType;
 use fluss::row::GenericRow;
@@ -301,6 +301,13 @@ impl FlussBackend for NativeFlussBackend {
     ) -> GatewayResult<()> {
         self.admin_call(ctx, "drop the partition", |admin| async move {
             admin.drop_partition(table, spec, false).await
+        })
+        .await
+    }
+
+    async fn cluster_health(&self, ctx: &RequestContext) -> GatewayResult<ClusterHealth> {
+        self.admin_call(ctx, "check the cluster health", |admin| async move {
+            admin.get_cluster_health().await
         })
         .await
     }

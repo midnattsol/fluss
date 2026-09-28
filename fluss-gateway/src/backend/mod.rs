@@ -31,7 +31,8 @@ use crate::backend::types::ClusterId;
 use crate::error::{GatewayError, GatewayResult, Resource};
 use async_trait::async_trait;
 use fluss::metadata::{
-    AlterTableChanges, PartitionInfo, PartitionSpec, TableDescriptor, TableInfo, TablePath,
+    AlterTableChanges, ClusterHealth, PartitionInfo, PartitionSpec, TableDescriptor, TableInfo,
+    TablePath,
 };
 use fluss::record::ChangeType;
 use fluss::row::GenericRow;
@@ -221,6 +222,14 @@ pub trait FlussBackend: Send + Sync + 'static {
         table: &TablePath,
         spec: &PartitionSpec,
     ) -> GatewayResult<()>;
+
+    /// Cluster-wide health for fail-fast write admission.
+    ///
+    /// This is the only ISR-derived fact the `fluss-rs` client exposes: per-bucket ISR is not
+    /// visible (the wire carries it, but the client's cluster metadata keeps the leader only), so
+    /// callers must treat non-GREEN as "the cluster may not satisfy write acknowledgements" and
+    /// refuse the batch rather than letting it run into per-row timeouts.
+    async fn cluster_health(&self, ctx: &RequestContext) -> GatewayResult<ClusterHealth>;
 
     /// Submits one batch of rows that has already been validated against the table schema.
     ///

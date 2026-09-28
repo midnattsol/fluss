@@ -2214,7 +2214,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss is unavailable, the gateway is starting or shutting down, or the table/schema changed before submission
+          description: Fluss is unavailable, the gateway is starting or shutting down, the table/schema changed before submission, or the cluster cannot satisfy write acknowledgements
         '504':
           content:
             application/json:

@@ -16,7 +16,9 @@
 // under the License.
 
 //! Batch writes: validation failures reject the request before submission; completed writes report
-//! per-entry outcomes. A request timeout cannot currently cancel native writes.
+//! per-entry outcomes. A request timeout cannot currently cancel native writes. Batches are refused
+//! with 503 while cluster health is not GREEN, so an unwritable cluster fails fast instead of
+//! timing out per row.
 
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
@@ -34,7 +36,7 @@ use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use fluss::TableId;
-use fluss::metadata::{TableInfo, TablePath};
+use fluss::metadata::{ClusterHealth, ClusterHealthStatus, TableInfo, TablePath};
 use fluss::record::ChangeType;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -367,6 +369,26 @@ fn preflight(
     WriteRequest::new(table, rows, change_types, targets).map_err(RowDecodeError::from)
 }
 
+/// Refuses a batch while the cluster cannot satisfy write acknowledgements.
+///
+/// Fail-fast is cluster-wide on purpose: the `fluss-rs` client exposes only
+/// `FlussAdmin::get_cluster_health`, and its cluster metadata keeps the bucket leader but drops
+/// the per-bucket ISR the wire carries, so a per-bucket min-ISR pre-check is not possible without
+/// extending the client. The cost is coarseness in both directions: a YELLOW or RED cluster refuses
+/// every batch even when the target buckets are healthy, and a GREEN cluster cannot catch a single
+/// stuck table before submission.
+fn require_writable(health: &ClusterHealth) -> GatewayResult<()> {
+    let status = match health.status {
+        ClusterHealthStatus::Green => return Ok(()),
+        ClusterHealthStatus::Yellow => "yellow",
+        ClusterHealthStatus::Red => "red",
+        ClusterHealthStatus::Unknown => "unknown",
+    };
+    Err(GatewayError::unavailable(format!(
+        "the cluster cannot satisfy write acknowledgements while its health status is {status}; retry the request"
+    )))
+}
+
 fn ensure_json_acceptable(headers: &axum::http::HeaderMap) -> GatewayResult<()> {
     let Some(accept) = headers
         .get(axum::http::header::ACCEPT)
@@ -492,7 +514,7 @@ pub struct WriteResponse {
         (status = 429, description = "The write concurrency gate or rate limit is exhausted; retry after the `Retry-After` pause", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
         (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
-        (status = 503, description = "Fluss is unavailable, the gateway is starting or shutting down, or the table/schema changed before submission", body = ErrorEnvelope),
+        (status = 503, description = "Fluss is unavailable, the gateway is starting or shutting down, the table/schema changed before submission, or the cluster cannot satisfy write acknowledgements", body = ErrorEnvelope),
         (status = 504, description = "The request deadline passed; writes may still complete after submission", body = ErrorEnvelope)
     )
 )]
@@ -551,6 +573,13 @@ async fn run_write(
         partial_update_columns,
     )
     .await?;
+
+    // Fail-fast admission: refuse the batch while the cluster cannot satisfy write
+    // acknowledgements instead of letting it run into per-row timeouts and client retries. This
+    // answers 503 with `Retry-After` through the shared error rendering, like every other
+    // `unavailable` condition.
+    let health = state.backend.cluster_health(&ctx).await?;
+    require_writable(&health)?;
 
     let result = state.backend.write(&ctx, write_request).await?;
 
@@ -1157,6 +1186,85 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "unavailable");
+    }
+
+    /// Fail-fast admission: a batch against a cluster that cannot satisfy write acknowledgements is
+    /// refused with 503 and `Retry-After` before anything is submitted, instead of timing out per
+    /// row and inviting the client retries that risk at-least-once duplication.
+    #[tokio::test]
+    async fn an_unwritable_cluster_refuses_the_batch_with_503_and_retry_after() {
+        let one = r#"{"entries":[{"id":"e1","upsert":{"id":1,"name":"ada"}}]}"#;
+        for status in [
+            ClusterHealthStatus::Yellow,
+            ClusterHealthStatus::Red,
+            ClusterHealthStatus::Unknown,
+        ] {
+            let backend = catalog();
+            backend.set_cluster_health(ClusterHealth {
+                num_replicas: 3,
+                in_sync_replicas: 2,
+                num_leader_replicas: 3,
+                active_leader_replicas: 3,
+                status,
+            });
+            let app = app(Arc::clone(&backend));
+
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(USERS)
+                        .header("content-type", "application/json")
+                        .body(Body::from(one.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "health status {status:?}"
+            );
+            assert!(
+                response.headers().contains_key("retry-after"),
+                "health status {status:?} carries Retry-After"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], "unavailable", "{body}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("retry the request")),
+                "{body}"
+            );
+            assert!(
+                backend.writes().is_empty(),
+                "health status {status:?} submits nothing"
+            );
+        }
+    }
+
+    /// A health check that cannot reach Fluss refuses the batch the same way: 503 with the shared
+    /// envelope, and nothing submitted.
+    #[tokio::test]
+    async fn a_failing_health_check_refuses_the_batch_with_503() {
+        let backend = catalog();
+        backend.fail_once(
+            crate::backend::fake::Operation::ClusterHealth,
+            GatewayError::unavailable("Fluss is unreachable"),
+        );
+        let app = app(Arc::clone(&backend));
+        let (status, body) = post(
+            &app,
+            USERS,
+            r#"{"entries":[{"id":"e1","upsert":{"id":1,"name":"ada"}}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "unavailable");
+        assert!(backend.writes().is_empty());
     }
 
     #[tokio::test]
