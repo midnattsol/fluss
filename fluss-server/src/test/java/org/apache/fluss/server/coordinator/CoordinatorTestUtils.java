@@ -19,13 +19,17 @@ package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.cluster.Endpoint;
 import org.apache.fluss.cluster.ServerType;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.protocol.ApiKeys;
+import org.apache.fluss.server.coordinator.event.EventManager;
 import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.tablet.TestTabletServerGateway;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.testutils.common.ScheduledTask;
+import org.apache.fluss.utils.concurrent.Scheduler;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -33,6 +37,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ScheduledFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -113,5 +118,44 @@ public class CoordinatorTestUtils {
         LeaderAndIsr leaderAndIsr = zooKeeperClient.getLeaderAndIsr(tableBucket).get();
         assertThat(leaderAndIsr.leaderEpoch()).isEqualTo(expectLeaderEpoch);
         assertThat(leaderAndIsr.leader()).isEqualTo(expectLeader);
+    }
+
+    /**
+     * Creates a request batch wired with a scheduler that records retries but never runs them, so
+     * tests keep the previous fire-and-forget behavior of failed notify-leader-and-isr sends.
+     */
+    public static CoordinatorRequestBatch newCoordinatorRequestBatch(
+            CoordinatorChannelManager channelManager,
+            EventManager eventManager,
+            CoordinatorContext coordinatorContext) {
+        return new CoordinatorRequestBatch(
+                channelManager,
+                eventManager,
+                coordinatorContext,
+                newNeverRunScheduler(),
+                ConfigOptions.COORDINATOR_NOTIFY_LEADER_AND_ISR_RETRY_DELAY
+                        .defaultValue()
+                        .toMillis());
+    }
+
+    /** Returns a scheduler that accepts tasks but never executes them. */
+    public static Scheduler newNeverRunScheduler() {
+        return new Scheduler() {
+            @Override
+            public void startup() {
+                // do nothing
+            }
+
+            @Override
+            public void shutdown() {
+                // do nothing
+            }
+
+            @Override
+            public ScheduledFuture<?> schedule(
+                    String name, Runnable task, long delayMs, long periodMs) {
+                return new ScheduledTask<>(() -> null, delayMs, periodMs);
+            }
+        };
     }
 }

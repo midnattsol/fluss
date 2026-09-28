@@ -131,7 +131,7 @@ class TableManagerTest {
         Configuration conf = new Configuration();
         conf.setString(ConfigOptions.REMOTE_DATA_DIR, "/tmp/fluss/remote-data");
         CoordinatorRequestBatch coordinatorRequestBatch =
-                new CoordinatorRequestBatch(
+                CoordinatorTestUtils.newCoordinatorRequestBatch(
                         testCoordinatorChannelManager, testingEventManager, coordinatorContext);
         ReplicaStateMachine replicaStateMachine =
                 new ReplicaStateMachine(

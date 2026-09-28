@@ -129,7 +129,7 @@ class TableBucketStateMachineTest {
         coordinatorContext = new CoordinatorContext(zkEpoch);
         testCoordinatorChannelManager = new TestCoordinatorChannelManager();
         coordinatorRequestBatch =
-                new CoordinatorRequestBatch(
+                CoordinatorTestUtils.newCoordinatorRequestBatch(
                         testCoordinatorChannelManager,
                         event -> {
                             // do nothing
@@ -353,7 +353,7 @@ class TableBucketStateMachineTest {
                 new CoordinatorEventManager(
                         coordinatorEventProcessor, TestingMetricGroups.COORDINATOR_METRICS);
         coordinatorRequestBatch =
-                new CoordinatorRequestBatch(
+                CoordinatorTestUtils.newCoordinatorRequestBatch(
                         testCoordinatorChannelManager, eventManager, coordinatorContext);
         tableBucketStateMachine =
                 new TableBucketStateMachine(

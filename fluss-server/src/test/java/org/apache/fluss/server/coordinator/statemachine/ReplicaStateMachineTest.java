@@ -27,7 +27,6 @@ import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
 import org.apache.fluss.server.coordinator.CoordinatorChannelManager;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
-import org.apache.fluss.server.coordinator.CoordinatorRequestBatch;
 import org.apache.fluss.server.coordinator.CoordinatorTestUtils;
 import org.apache.fluss.server.coordinator.TestCoordinatorChannelManager;
 import org.apache.fluss.server.coordinator.event.DeleteReplicaResponseReceivedEvent;
@@ -315,7 +314,7 @@ class ReplicaStateMachineTest {
     private ReplicaStateMachine createReplicaStateMachine(CoordinatorContext coordinatorContext) {
         return new ReplicaStateMachine(
                 coordinatorContext,
-                new CoordinatorRequestBatch(
+                CoordinatorTestUtils.newCoordinatorRequestBatch(
                         new CoordinatorChannelManager(
                                 RpcClient.create(
                                         new Configuration(),
@@ -336,7 +335,7 @@ class ReplicaStateMachineTest {
             Map<TableBucketReplica, Boolean> isReplicaDeleteSuccess) {
         return new ReplicaStateMachine(
                 coordinatorContext,
-                new CoordinatorRequestBatch(
+                CoordinatorTestUtils.newCoordinatorRequestBatch(
                         testCoordinatorChannelManager,
                         (event) -> {
                             if (event instanceof DeleteReplicaResponseReceivedEvent) {
