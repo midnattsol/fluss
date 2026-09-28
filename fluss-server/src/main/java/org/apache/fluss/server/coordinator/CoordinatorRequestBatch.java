@@ -627,6 +627,27 @@ public class CoordinatorRequestBatch {
                                     "Failed to send stop replica request to tablet server {}.",
                                     serverId,
                                     throwable);
+                            // The transport outcome never feeds back to the replica state machine,
+                            // so a lost stopReplica(delete=true) would leave the replica in
+                            // ReplicaDeletionStarted forever and wedge the table deletion. Feed the
+                            // failure back as a DeleteReplicaResponseReceivedEvent so the existing
+                            // retry chain (DELETE_TRY_TIMES retries, then force-success) drives the
+                            // deletion to completion. Only delete=true buckets are routed here;
+                            // delete=false (migration/follower-stop) sends stay best-effort and
+                            // produce no deletion event.
+                            if (!deletedReplicaBuckets.isEmpty()) {
+                                List<DeleteReplicaResultForBucket> deleteReplicaResultForBuckets =
+                                        new ArrayList<>();
+                                ApiError transportError = ApiError.fromThrowable(throwable);
+                                for (TableBucket tableBucket : deletedReplicaBuckets) {
+                                    deleteReplicaResultForBuckets.add(
+                                            new DeleteReplicaResultForBucket(
+                                                    tableBucket, serverId, transportError));
+                                }
+                                eventManager.put(
+                                        new DeleteReplicaResponseReceivedEvent(
+                                                deleteReplicaResultForBuckets));
+                            }
                             return;
                         }
                         // handle the response
