@@ -42,7 +42,53 @@ public class S3DelegationTokenProviderTest {
         conf.set("fs.s3a.region", "us-east-1");
         conf.set("fs.s3a.assumed.role.arn", "arn:aws:iam::123456789012:role/test-role");
 
-        assertThatCode(() -> new S3DelegationTokenProvider("s3", conf)).doesNotThrowAnyException();
+        S3DelegationTokenProvider provider = new S3DelegationTokenProvider("s3", conf);
+
+        assertThat(provider.createAssumeRoleRequest().policy()).isNull();
+    }
+
+    @Test
+    void testAssumeRoleSessionPolicyRestrictsOnlyIssuedToken() throws IOException {
+        Configuration conf = new Configuration();
+        conf.set("fs.s3a.region", "us-east-1");
+        conf.set("fs.s3a.access.key", "serverCanWrite");
+        conf.set("fs.s3a.secret.key", "serverSecret");
+        conf.set("fs.s3a.assumed.role.arn", "arn:aws:iam::rustfs:role/fluss-read");
+        String policy =
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                        + "\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::fluss-lab/*\"]}]}";
+        conf.set("fs.s3a.assumed.role.policy", policy);
+
+        S3DelegationTokenProvider provider = new S3DelegationTokenProvider("s3", conf);
+
+        assertThat(provider.createAssumeRoleRequest().policy()).isEqualTo(policy);
+        assertThat(provider.createStsCredentialsProvider().resolveCredentials().accessKeyId())
+                .isEqualTo("serverCanWrite");
+    }
+
+    @Test
+    void testSessionPolicyWithoutRoleArnIsRejected() {
+        Configuration conf = new Configuration();
+        conf.set("fs.s3a.region", "us-east-1");
+        conf.set("fs.s3a.access.key", "serverCanWrite");
+        conf.set("fs.s3a.secret.key", "serverSecret");
+        conf.set("fs.s3a.assumed.role.policy", "{}");
+
+        assertThatThrownBy(() -> new S3DelegationTokenProvider("s3", conf))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("requires a role ARN");
+    }
+
+    @Test
+    void testBlankSessionPolicyIsRejected() {
+        Configuration conf = new Configuration();
+        conf.set("fs.s3a.region", "us-east-1");
+        conf.set("fs.s3a.assumed.role.arn", "arn:aws:iam::rustfs:role/fluss-read");
+        conf.set("fs.s3a.assumed.role.policy", "  ");
+
+        assertThatThrownBy(() -> new S3DelegationTokenProvider("s3", conf))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must not be blank");
     }
 
     @Test

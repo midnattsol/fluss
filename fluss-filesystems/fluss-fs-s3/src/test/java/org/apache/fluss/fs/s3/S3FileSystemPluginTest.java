@@ -68,6 +68,23 @@ class S3FileSystemPluginTest {
     }
 
     @Test
+    void testFlussAssumeRolePolicyIsPassedOnlyToHadoopConfiguration() {
+        Configuration flussConfig = new Configuration();
+        String policy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        flussConfig.setString("s3.assumed.role.arn", "arn:aws:iam::rustfs:role/fluss-read");
+        flussConfig.setString("s3.assumed.role.policy", policy);
+        flussConfig.setString("s3.access-key", "serverWriter");
+        flussConfig.setString("s3.secret-key", "serverSecret");
+
+        org.apache.hadoop.conf.Configuration hadoopConfig =
+                new S3FileSystemPlugin().buildHadoopConfiguration(flussConfig);
+
+        assertThat(hadoopConfig.get("fs.s3a.assumed.role.policy")).isEqualTo(policy);
+        assertThat(hadoopConfig.get("fs.s3a.access.key")).isEqualTo("serverWriter");
+        assertThat(hadoopConfig.get("fs.s3a.secret.key")).isEqualTo("serverSecret");
+    }
+
+    @Test
     void testServerModeWithConfiguredCredentialProvider() {
         Configuration flussConfig = new Configuration();
         flussConfig.setString(

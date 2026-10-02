@@ -67,6 +67,7 @@ public class S3DelegationTokenProvider {
     private static final String PATH_STYLE_ACCESS_KEY = "fs.s3a.path.style.access";
 
     private static final String ROLE_ARN_KEY = "fs.s3a.assumed.role.arn";
+    private static final String ROLE_SESSION_POLICY_KEY = "fs.s3a.assumed.role.policy";
     private static final String STS_ENDPOINT_KEY = "fs.s3a.assumed.role.sts.endpoint";
 
     private final String scheme;
@@ -74,6 +75,7 @@ public class S3DelegationTokenProvider {
     @Nullable private final String accessKey;
     @Nullable private final String secretKey;
     @Nullable private final String roleArn;
+    @Nullable private final String roleSessionPolicy;
     @Nullable private final String stsEndpoint;
     @Nullable private final AWSCredentialProviderList credentialProviderList;
     private final Map<String, String> additionInfos;
@@ -85,6 +87,7 @@ public class S3DelegationTokenProvider {
         this.accessKey = conf.get(ACCESS_KEY_ID);
         this.secretKey = conf.get(ACCESS_KEY_SECRET);
         this.roleArn = conf.get(ROLE_ARN_KEY);
+        this.roleSessionPolicy = conf.getTrimmed(ROLE_SESSION_POLICY_KEY);
         this.stsEndpoint = conf.get(STS_ENDPOINT_KEY);
         boolean hasCredentialProvider =
                 conf.getBoolean(CREDENTIAL_PROVIDER_EXPLICITLY_CONFIGURED, false)
@@ -114,6 +117,12 @@ public class S3DelegationTokenProvider {
                     roleArn != null,
                     "Role ARN must be set when static credentials are not provided.");
         }
+        checkArgument(
+                roleSessionPolicy == null || roleArn != null,
+                "AssumeRole session policy requires a role ARN.");
+        checkArgument(
+                roleSessionPolicy == null || !roleSessionPolicy.isEmpty(),
+                "AssumeRole session policy must not be blank.");
 
         this.additionInfos = new HashMap<>();
         for (String key : Arrays.asList(REGION_KEY, ENDPOINT_KEY, PATH_STYLE_ACCESS_KEY)) {
@@ -129,11 +138,7 @@ public class S3DelegationTokenProvider {
 
             if (roleArn != null) {
                 LOG.info("Obtaining session credentials via AssumeRole, role: {}", roleArn);
-                AssumeRoleRequest request =
-                        AssumeRoleRequest.builder()
-                                .roleArn(roleArn)
-                                .roleSessionName("fluss-" + UUID.randomUUID())
-                                .build();
+                AssumeRoleRequest request = createAssumeRoleRequest();
                 AssumeRoleResponse response = stsClient.assumeRole(request);
                 credentials = response.credentials();
             } else {
@@ -157,6 +162,18 @@ public class S3DelegationTokenProvider {
                     credentials.expiration().toEpochMilli(),
                     additionInfos);
         }
+    }
+
+    @VisibleForTesting
+    AssumeRoleRequest createAssumeRoleRequest() {
+        AssumeRoleRequest.Builder builder =
+                AssumeRoleRequest.builder()
+                        .roleArn(roleArn)
+                        .roleSessionName("fluss-" + UUID.randomUUID());
+        if (roleSessionPolicy != null) {
+            builder.policy(roleSessionPolicy);
+        }
+        return builder.build();
     }
 
     @VisibleForTesting
