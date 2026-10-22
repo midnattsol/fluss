@@ -259,6 +259,9 @@ message ProduceLogRequest {
   required int64 table_id = 2;
   required int32 timeout_ms = 3;
   repeated PbProduceLogReqForBucket buckets_req = 4;
+  // Version 2: Required for recoverable appends; 1 = new send, 2 = retry. Unset preserves the
+  // ordinary PRODUCE_LOG behavior. Clients must not downgrade a request carrying this field.
+  optional int32 recovery_mode = 5;
 }
 
 message ProduceLogResponse {

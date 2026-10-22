@@ -27,6 +27,8 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
+import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.exception.UnknownWriterIdException;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -39,6 +41,7 @@ import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.rpc.protocol.RecoverableWriteMode;
 import org.apache.fluss.server.log.LocalLog.SegmentDeletionReason;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -498,12 +501,18 @@ public final class LogTablet {
      * Leader Epochs.
      */
     public LogAppendInfo appendAsLeader(MemoryLogRecords records) throws Exception {
-        return append(records, true);
+        return append(records, true, RecoverableWriteMode.NONE);
+    }
+
+    /** Appends a batch with the requested recoverable-write mode. */
+    public LogAppendInfo appendAsLeader(MemoryLogRecords records, int recoverableWriteMode)
+            throws Exception {
+        return append(records, true, recoverableWriteMode);
     }
 
     /** Append this message set to the active segment of the local log without assigning offsets. */
     public LogAppendInfo appendAsFollower(MemoryLogRecords records) throws Exception {
-        return append(records, false);
+        return append(records, false, RecoverableWriteMode.NONE);
     }
 
     /** Read messages from the local log without projection or filter. */
@@ -920,7 +929,8 @@ public final class LogTablet {
      * if the appendAsLeader=false flag is passed we will only check that the existing offsets are
      * valid.
      */
-    private LogAppendInfo append(MemoryLogRecords records, boolean appendAsLeader)
+    private LogAppendInfo append(
+            MemoryLogRecords records, boolean appendAsLeader, int recoverableWriteMode)
             throws Exception {
         LogAppendInfo appendInfo = analyzeAndValidateRecords(records);
 
@@ -953,13 +963,50 @@ public final class LogTablet {
                 }
             }
 
-            // maybe roll the log if this segment is full.
-            maybeRoll(validRecords.sizeInBytes(), appendInfo);
+            validateRecoverableWriteMode(validRecords, recoverableWriteMode);
+
+            if (recoverableWriteMode == RecoverableWriteMode.RETRY) {
+                LogRecordBatch batch = validRecords.batches().iterator().next();
+                if (!writerStateManager.lastEntry(batch.writerId()).isPresent()) {
+                    throw new UnknownWriterIdException(
+                            "Cannot safely retry batch for unknown or expired writer "
+                                    + batch.writerId());
+                }
+            }
 
             // now that we have valid records, offsets assigned, we need to validate the idempotent
             // state of the writers and collect some metadata.
             Either<WriterStateEntry.BatchMetadata, Collection<WriterAppendInfo>> validateResult =
                     analyzeAndValidateWriterState(validRecords, appendAsLeader);
+
+            if (recoverableWriteMode == RecoverableWriteMode.RETRY) {
+                if (validateResult.isRight()) {
+                    LogRecordBatch batch = validRecords.batches().iterator().next();
+                    WriterStateEntry writerEntry =
+                            writerStateManager.lastEntry(batch.writerId()).get();
+                    if (!WriterAppendInfo.isNextBatchSequence(
+                            writerEntry.lastBatchSequence(), batch.batchSequence())) {
+                        throw new OutOfOrderSequenceException(
+                                "Recoverable retry does not match a retained batch for writer "
+                                        + batch.writerId()
+                                        + " sequence "
+                                        + batch.batchSequence());
+                    }
+                } else {
+                    validateRecoverableDuplicate(
+                            validRecords.batches().iterator().next(), validateResult.left());
+                }
+            } else if (recoverableWriteMode == RecoverableWriteMode.NEW_SEND
+                    && validateResult.isLeft()) {
+                throw new DuplicateSequenceException(
+                        "A new recoverable send reused writer "
+                                + validateResult.left().writerId
+                                + " sequence "
+                                + validateResult.left().batchSequence);
+            }
+
+            // maybe roll the log if this segment is full.
+            maybeRoll(validRecords.sizeInBytes(), appendInfo);
 
             if (validateResult.isLeft()) {
                 // have duplicated batch metadata, skip the append and update append info.
@@ -1028,6 +1075,58 @@ public final class LogTablet {
         if (getHighWatermark() >= localLog.getLocalLogEndOffset()) {
             updateHighWatermarkMetadata(localLog.getLocalLogEndOffsetMetadata());
         }
+    }
+
+    private void validateRecoverableWriteMode(MemoryLogRecords records, int recoverableWriteMode) {
+        if (recoverableWriteMode == RecoverableWriteMode.NONE) {
+            return;
+        }
+        if (!RecoverableWriteMode.isValid(recoverableWriteMode)) {
+            throw new IllegalArgumentException(
+                    "Unsupported recoverable write mode " + recoverableWriteMode);
+        }
+        java.util.Iterator<LogRecordBatch> batches = records.batches().iterator();
+        if (!batches.hasNext()) {
+            throw new UnknownWriterIdException("Recoverable writes require one writer batch");
+        }
+        LogRecordBatch batch = batches.next();
+        if (!batch.hasWriterId() || batches.hasNext()) {
+            throw new UnknownWriterIdException(
+                    "Recoverable writes require exactly one batch with a writer id");
+        }
+    }
+
+    private void validateRecoverableDuplicate(
+            LogRecordBatch incomingBatch, WriterStateEntry.BatchMetadata duplicateBatch)
+            throws IOException {
+        FetchDataInfo existing =
+                localLog.read(
+                        duplicateBatch.firstOffset(),
+                        Integer.MAX_VALUE,
+                        true,
+                        localLog.getLocalLogEndOffsetMetadata(),
+                        null,
+                        null);
+        if (existing != null) {
+            for (LogRecordBatch existingBatch : existing.getRecords().batches()) {
+                if (existingBatch.baseLogOffset() == duplicateBatch.firstOffset()) {
+                    if (incomingBatch.checksum() == existingBatch.checksum()) {
+                        return;
+                    }
+                    throw new DuplicateSequenceException(
+                            "Recoverable retry payload differs from the retained batch for writer "
+                                    + incomingBatch.writerId()
+                                    + " sequence "
+                                    + incomingBatch.batchSequence());
+                }
+            }
+        }
+        throw new UnknownWriterIdException(
+                "Cannot safely retry writer "
+                        + incomingBatch.writerId()
+                        + " sequence "
+                        + incomingBatch.batchSequence()
+                        + ": retained batch is no longer readable");
     }
 
     private AssignResult assignOffsetAndTimestamp(

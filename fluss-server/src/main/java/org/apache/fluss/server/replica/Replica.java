@@ -55,6 +55,7 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.rpc.protocol.RecoverableWriteMode;
 import org.apache.fluss.rpc.util.PredicateMessageUtils;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
@@ -1272,6 +1273,12 @@ public final class Replica {
 
     public LogAppendInfo appendRecordsToLeader(MemoryLogRecords memoryLogRecords, int requiredAcks)
             throws Exception {
+        return appendRecordsToLeader(memoryLogRecords, requiredAcks, RecoverableWriteMode.NONE);
+    }
+
+    public LogAppendInfo appendRecordsToLeader(
+            MemoryLogRecords memoryLogRecords, int requiredAcks, int recoverableWriteMode)
+            throws Exception {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
@@ -1293,7 +1300,8 @@ public final class Replica {
                     // TODO WRITE a leader epoch.
                     LogAppendInfo appendInfo;
                     try {
-                        appendInfo = logTablet.appendAsLeader(memoryLogRecords);
+                        appendInfo =
+                                logTablet.appendAsLeader(memoryLogRecords, recoverableWriteMode);
                     } catch (IOException e) {
                         LOG.error("Error while appending records to {}", tableBucket, e);
                         fatalErrorHandler.onFatalError(e);
