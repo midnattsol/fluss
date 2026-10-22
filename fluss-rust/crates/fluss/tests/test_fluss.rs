@@ -27,6 +27,8 @@ mod integration {
     mod kv_changelog;
     mod kv_table;
     mod log_table;
+    #[cfg(feature = "recoverable_integration_tests")]
+    mod prepared_log_batch;
     mod record_batch_log_reader;
     mod sasl_auth;
 

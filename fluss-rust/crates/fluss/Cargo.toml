@@ -41,6 +41,7 @@ storage-fs = ["opendal/services-fs"]
 storage-s3 = ["opendal/services-s3"]
 storage-oss = ["opendal/services-oss"]
 integration_tests = []
+recoverable_integration_tests = ["integration_tests"]
 
 [dependencies]
 arrow = { workspace = true }
