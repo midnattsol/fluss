@@ -891,6 +891,27 @@ final class LogTabletTest extends LogTestBase {
         assertThat(logTablet.localLogEndOffset()).isEqualTo(endOffset);
     }
 
+    @Test
+    void testRecoverableRetryAfterRetainedRecordTruncationFailsClosed() throws Exception {
+        long writerId = 85L;
+        List<Object[]> rows = Collections.singletonList(new Object[] {1, "truncated-record"});
+        logTablet.appendAsLeader(
+                genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                RecoverableWriteMode.NEW_SEND);
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(1L);
+
+        assertThat(logTablet.truncateTo(0L)).isTrue();
+        long endOffset = logTablet.localLogEndOffset();
+
+        assertThatThrownBy(
+                        () ->
+                                logTablet.appendAsLeader(
+                                        genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                                        RecoverableWriteMode.RETRY))
+                .isInstanceOf(UnknownWriterIdException.class);
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(endOffset);
+    }
+
     private LogTablet createLogTablet(Configuration config) throws Exception {
         File logDir =
                 LogTestUtils.makeRandomLogTabletDir(
