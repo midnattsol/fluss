@@ -18,6 +18,7 @@
 use crate::TableId;
 use crate::bucketing::BucketingFunction;
 use crate::client::metadata::Metadata;
+use crate::client::table::{PreparedLogBatch, RecoverableWriteMode};
 use crate::client::write::IdempotenceManager;
 use crate::client::write::broadcast;
 use crate::client::write::bucket_assigner::{
@@ -29,8 +30,9 @@ use crate::cluster::Cluster;
 use crate::config::Config;
 use crate::config::NoKeyAssigner;
 use crate::error::{Error, FlussError, Result};
-use crate::metadata::{PhysicalTablePath, TableInfo, TablePath};
+use crate::metadata::{PhysicalTablePath, TableBucket, TableInfo, TablePath};
 use crate::metrics::WriterMetrics;
+use crate::rpc::message::ProduceLogRequest;
 use dashmap::DashMap;
 use log::warn;
 use parking_lot::Mutex;
@@ -116,6 +118,44 @@ impl WriterClient {
 
     pub fn send(&self, record: &WriteRecord<'_>) -> Result<ResultHandle> {
         self.send_routed(record, None)
+    }
+
+    pub(crate) async fn resolve_partition_id(
+        &self,
+        physical_path: &PhysicalTablePath,
+    ) -> Result<Option<i64>> {
+        self.metadata
+            .check_and_update_partition_metadata(physical_path)
+            .await
+    }
+
+    pub(crate) async fn send_prepared_log_batch(
+        &self,
+        table_path: &TablePath,
+        batch: &PreparedLogBatch,
+        mode: RecoverableWriteMode,
+    ) -> Result<crate::proto::ProduceLogResponse> {
+        let bucket = TableBucket::new_with_partition(
+            batch.table_id(),
+            batch.partition_id(),
+            batch.bucket_id(),
+        );
+        let leader = self
+            .metadata
+            .leader_for(table_path, &bucket)
+            .await?
+            .ok_or_else(|| Error::IllegalArgument {
+                message: format!("No known leader for recoverable batch bucket {bucket}"),
+            })?;
+        let connection = self.metadata.get_connection(&leader).await?;
+        let request = ProduceLogRequest::new_prepared(
+            batch.table_id(),
+            batch.partition_id(),
+            batch.bucket_id(),
+            batch.records().clone(),
+            mode.as_protocol_value(),
+        );
+        connection.request(request).await.map_err(Into::into)
     }
 
     pub(crate) fn routing_bucket_count(

@@ -34,7 +34,62 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+const MAX_PREPARED_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
 pub(crate) mod broadcast;
+
+pub(crate) fn encode_prepared_arrow_batch(
+    table_info: &TableInfo,
+    physical_table_path: Arc<PhysicalTablePath>,
+    record_batch: Arc<RecordBatch>,
+    writer_id: i64,
+    batch_sequence: i32,
+) -> crate::error::Result<Bytes> {
+    use crate::client::WriteRecord;
+    use crate::client::write::batch::ArrowLogWriteBatch;
+    use crate::compression::ArrowCompressionRatioEstimator;
+    use crate::error::Error::IllegalArgument;
+    use crate::record::ArrowBatchConfig;
+    use std::sync::Arc;
+
+    let stats_index_mapping = if table_info
+        .get_table_config()
+        .get_statistics_columns()
+        .is_enabled()
+    {
+        Some(table_info.get_stats_index_mapping()?.to_vec())
+    } else {
+        None
+    };
+    let mut batch = ArrowLogWriteBatch::new(
+        0,
+        Arc::clone(&physical_table_path),
+        table_info.table_id,
+        ArrowBatchConfig {
+            schema_id: table_info.schema_id,
+            row_type: table_info.row_type.clone(),
+            stats_index_mapping,
+            compression: table_info.get_table_config().get_arrow_compression_info()?,
+            write_limit: MAX_PREPARED_BATCH_BYTES,
+            compression_ratio_estimator: Arc::new(ArrowCompressionRatioEstimator::new()),
+        },
+        0,
+        true,
+    )?;
+    batch.set_writer_state(writer_id, batch_sequence);
+    let record = WriteRecord::for_append_record_batch(
+        Arc::new(table_info.clone()),
+        physical_table_path,
+        table_info.schema_id,
+        (*record_batch).clone(),
+    );
+    if batch.try_append(&record)?.is_none() {
+        return Err(IllegalArgument {
+            message: "failed to prepare Arrow batch".to_string(),
+        });
+    }
+    batch.build()
+}
 mod bucket_assigner;
 
 mod sender;
