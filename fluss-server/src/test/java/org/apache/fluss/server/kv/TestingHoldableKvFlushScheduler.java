@@ -55,6 +55,14 @@ public class TestingHoldableKvFlushScheduler extends KvFlushScheduler {
         }
     }
 
+    /** Releases held flushes and resumes normal asynchronous scheduling. */
+    public void releaseFlushes() {
+        synchronized (this) {
+            holding = false;
+        }
+        runHeldFlushes();
+    }
+
     @Override
     public void enqueue(KvTablet tablet) {
         synchronized (this) {

@@ -19,6 +19,7 @@ package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableBucketSnapshot;
@@ -35,8 +36,10 @@ import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.coordinator.TestCoordinatorGateway;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.kv.KvFlushScheduler;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.TestingHoldableKvFlushScheduler;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.DefaultSnapshotContext;
@@ -105,6 +108,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
 
+    private TestingHoldableKvFlushScheduler holdableKvFlushScheduler;
+
+    @Override
+    protected KvFlushScheduler createTestKvFlushScheduler(Configuration conf) {
+        holdableKvFlushScheduler = new TestingHoldableKvFlushScheduler(conf);
+        return holdableKvFlushScheduler;
+    }
+
     private static final TableBucket TABLE_BUCKET = new TableBucket(DATA1_TABLE_ID_PK, 1);
 
     @Override
@@ -170,12 +181,13 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
     }
 
     @Test
-    void testFailedRestoreClosesKvBeforeRetry(@TempDir File remoteDir) throws Exception {
+    void testSnapshotAheadOfNonemptyLocalLogFailsBeforeLoadingKv(@TempDir File remoteDir)
+            throws Exception {
         RemoteRestoreSnapshotContext context = new RemoteRestoreSnapshotContext(remoteDir);
         CompletedSnapshot remoteSnapshot = writeDataAndTakeSnapshot(context);
         wipeLocalKvState(context.replica);
-        // A nonempty log ending before the snapshot offset is inconsistent: fail closed, but
-        // retry without retaining RocksDB's LOCK from the previous attempt.
+        // A nonempty log ending before the snapshot offset cannot be reconstructed without a
+        // remote log manifest; reject it before downloading or opening the snapshot.
         logManager.truncateTo(TABLE_BUCKET, remoteSnapshot.getLogOffset() - 1);
 
         RemoteRestoreSnapshotContext freshContext = new RemoteRestoreSnapshotContext(remoteDir);
@@ -183,11 +195,9 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         assertThatThrownBy(() -> makeFreshLeader(freshContext))
                 .hasRootCauseMessage(
                         String.format(
-                                "Cannot restore snapshot at offset %s for %s: local log ends at %s but still contains records.",
-                                remoteSnapshot.getLogOffset(),
-                                TABLE_BUCKET,
-                                remoteSnapshot.getLogOffset() - 1));
-        assertThat(freshContext.downloadEvents).hasSize(5);
+                                "Local log ends before snapshot offset %s for %s without remote logs.",
+                                remoteSnapshot.getLogOffset(), TABLE_BUCKET));
+        assertThat(freshContext.downloadEvents).isEmpty();
         assertThat(kvManager.getKv(TABLE_BUCKET)).isEmpty();
     }
 
@@ -230,6 +240,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         KvRecordBatchFactory batches = KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
         putRecordsToLeader(
                 original, batches.ofRecords(genKvRecords(new Object[] {1, "a"}), 77L, 0));
+        holdableKvFlushScheduler.holdFlushes();
         long flushedOffset = original.getKvTablet().getFlushedLogOffset();
         // The next WAL batch is accepted locally, but not flushed into the KV snapshot.
         original.putRecordsToLeader(
@@ -243,6 +254,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
                 context.testKvSnapshotStore.waitUntilSnapshotComplete(TABLE_BUCKET, 0);
         assertThat(snapshot.getLogOffset()).isEqualTo(flushedOffset);
         assertThat(snapshot.getWriterSnapshotPath()).isNotNull();
+        holdableKvFlushScheduler.releaseFlushes();
 
         wipeLocalKvState(original);
         logManager.truncateFullyAndStartAt(TABLE_BUCKET, 0);
@@ -287,6 +299,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
                         .physicalTablePath(DATA1_PHYSICAL_TABLE_PATH_PK)
                         .build();
         remoteLogStorage.copyLogSegmentFiles(
+                FlussPaths.remoteLogDir(conf),
                 remoteSegment,
                 new LogSegmentFiles(
                         segment.getFileLogRecords().file().toPath(),
@@ -377,7 +390,7 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         assertThatThrownBy(() -> makeFreshLeader(fresh))
                 .hasRootCauseMessage(
                         String.format(
-                                "Cannot initialize %s with an empty log: this bucket has written data but has no verifiable snapshot.",
+                                "Cannot initialize %s with an empty log: this bucket has written data but no verifiable snapshot.",
                                 TABLE_BUCKET));
         assertThat(original.replica.getLocalLogEndOffset()).isZero();
     }
@@ -581,7 +594,10 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
         // ZK yields nothing, so discovery falls back to listing remote storage and parses the
         // snapshot metadata with the existing serde: assert parsed fields, not strings.
         Optional<CompletedSnapshot> discovered =
-                freshContext.getLatestRemoteSnapshot(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET);
+                freshContext.getLatestRemoteSnapshot(
+                        DATA1_PHYSICAL_TABLE_PATH_PK,
+                        TABLE_BUCKET,
+                        conf.getString(ConfigOptions.REMOTE_DATA_DIR));
         assertThat(discovered.isPresent()).isTrue();
         assertThat(discovered.get().getSnapshotID()).isEqualTo(remoteSnapshot.getSnapshotID());
         assertThat(discovered.get().getLogOffset()).isEqualTo(remoteSnapshot.getLogOffset());
@@ -608,13 +624,59 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
     }
 
     @Test
+    void testRemoteSnapshotDiscoveryUsesAssignedRemoteDataRoot(@TempDir File remoteDir)
+            throws Exception {
+        String assignedRemoteDataDir = new File(tempDir, "assigned-remote-root").getAbsolutePath();
+        zkClient.updateTable(
+                DATA1_TABLE_PATH_PK,
+                zkClient.getTable(DATA1_TABLE_PATH_PK)
+                        .get()
+                        .newRemoteDataDir(assignedRemoteDataDir));
+        FsPath assignedKvDir = FlussPaths.remoteKvDir(assignedRemoteDataDir);
+        FsPath assignedTabletDir =
+                FlussPaths.remoteKvTabletDir(
+                        assignedKvDir, DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET);
+        assertThat(new File(assignedTabletDir.toString()).mkdirs()).isTrue();
+
+        RemoteRestoreSnapshotContext original =
+                new RemoteRestoreSnapshotContext(new File(assignedTabletDir.toString()));
+        Replica source = startLeaderWithSnapshotData(original);
+        CompletedSnapshot snapshot =
+                original.testKvSnapshotStore.waitUntilSnapshotComplete(TABLE_BUCKET, 0);
+        putRecordsToLeader(source, genKvRecordBatch(new Object[] {3, "tail"}));
+        wipeLocalKvState(source);
+        Files.write(
+                new File(
+                                CompletedSnapshot.getMetadataFilePath(
+                                                snapshot.getSnapshotLocation())
+                                        .getPath())
+                        .toPath(),
+                CompletedSnapshotJsonSerde.toJson(snapshot));
+
+        DefaultSnapshotContext context = newDefaultSnapshotContext(null);
+        Replica restored = makeFreshLeader(context);
+        assertThat(restored.getKvTablet()).isNotNull();
+        flushAndWait(restored.getKvTablet(), restored.getLocalLogEndOffset());
+        assertHasKeyValues(
+                restored.getKvTablet(),
+                getKeyValuePairs(
+                        genKvRecords(
+                                new Object[] {1, "a"},
+                                new Object[] {2, "b"},
+                                new Object[] {3, "tail"})));
+    }
+
+    @Test
     void testS3EmptyStaysHealthyEmpty() throws Exception {
         DefaultSnapshotContext freshContext = newDefaultSnapshotContext(null);
 
         // No snapshot anywhere: ZK is empty and remote storage holds nothing.
         assertThat(
                         freshContext
-                                .getLatestRemoteSnapshot(DATA1_PHYSICAL_TABLE_PATH_PK, TABLE_BUCKET)
+                                .getLatestRemoteSnapshot(
+                                        DATA1_PHYSICAL_TABLE_PATH_PK,
+                                        TABLE_BUCKET,
+                                        conf.getString(ConfigOptions.REMOTE_DATA_DIR))
                                 .isPresent())
                 .isFalse();
 
@@ -858,7 +920,8 @@ class ReplicaRestoreFromRemoteSnapshotTest extends ReplicaTestBase {
 
         @Override
         public Optional<CompletedSnapshot> getLatestRemoteSnapshot(
-                PhysicalTablePath physicalPath, TableBucket tableBucket) throws Exception {
+                PhysicalTablePath physicalPath, TableBucket tableBucket, String remoteDataDir)
+                throws Exception {
             if (failRemoteDiscovery) {
                 throw new IOException("remote storage unavailable");
             }

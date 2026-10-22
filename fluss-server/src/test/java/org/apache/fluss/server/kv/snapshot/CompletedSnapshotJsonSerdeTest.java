@@ -22,15 +22,54 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.utils.json.JsonSerdeTestBase;
 
+import org.junit.jupiter.api.Test;
+
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde}. */
 class CompletedSnapshotJsonSerdeTest extends JsonSerdeTestBase<CompletedSnapshot> {
 
     protected CompletedSnapshotJsonSerdeTest() {
         super(CompletedSnapshotJsonSerde.INSTANCE);
+    }
+
+    @Test
+    void testFileDigestRoundTrip() {
+        String sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        CompletedSnapshot snapshot =
+                new CompletedSnapshot(
+                        new TableBucket(1, 1),
+                        1,
+                        new FsPath("oss://bucket/snapshot"),
+                        KvSnapshotHandle.create(
+                                Collections.emptyList(),
+                                Collections.singletonList(
+                                        KvFileHandleAndLocalPath.of(
+                                                new KvFileHandle(
+                                                        "oss://bucket/snapshot/private.sst",
+                                                        10,
+                                                        sha256),
+                                                "private.sst")),
+                                10),
+                        10,
+                        null,
+                        null);
+
+        CompletedSnapshot restored =
+                CompletedSnapshotJsonSerde.fromJson(CompletedSnapshotJsonSerde.toJson(snapshot));
+        assertThat(
+                        restored.getKvSnapshotHandle()
+                                .getPrivateFileHandles()
+                                .get(0)
+                                .getKvFileHandle()
+                                .getSha256())
+                .isEqualTo(sha256);
+        assertThat(CompletedSnapshotJsonSerde.toJson(restored))
+                .isEqualTo(CompletedSnapshotJsonSerde.toJson(snapshot));
     }
 
     @Override

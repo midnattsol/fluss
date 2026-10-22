@@ -60,6 +60,7 @@ impl Default for FakeState {
                 num_leader_replicas: 1,
                 active_leader_replicas: 1,
                 status: ClusterHealthStatus::Green,
+                data_at_risk: Some(false),
             },
         }
     }

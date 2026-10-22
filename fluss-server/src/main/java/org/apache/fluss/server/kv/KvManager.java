@@ -26,7 +26,6 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.KvStorageException;
-import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.memory.LazyMemorySegmentPool;
 import org.apache.fluss.metadata.KvFormat;
@@ -38,6 +37,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.TabletManagerBase;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.ZkSequenceGeneratorFactory;
+import org.apache.fluss.server.kv.rocksdb.RocksDBResourceContainer;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
@@ -51,14 +51,16 @@ import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.SystemClock;
+import org.apache.fluss.utils.function.SupplierWithException;
 import org.apache.fluss.utils.types.Tuple2;
 
-import org.rocksdb.Cache;
-import org.rocksdb.LRUCache;
-import org.rocksdb.RateLimiter;
-import org.rocksdb.RateLimiterMode;
-import org.rocksdb.RocksDB;
-import org.rocksdb.WriteBufferManager;
+import io.github.fluss_contrib.rocksdb.Cache;
+import io.github.fluss_contrib.rocksdb.HyperClockCache;
+import io.github.fluss_contrib.rocksdb.LRUCache;
+import io.github.fluss_contrib.rocksdb.RateLimiter;
+import io.github.fluss_contrib.rocksdb.RateLimiterMode;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.WriteBufferManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -82,6 +84,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
 
 import static org.apache.fluss.utils.Preconditions.checkState;
@@ -94,6 +97,8 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
  */
 @ThreadSafe
 public final class KvManager extends TabletManagerBase implements ServerReconfigurable {
+
+    private final ReentrantLock tabletCreationOrDeletionLock = new ReentrantLock();
 
     private static final Logger LOG = LoggerFactory.getLogger(KvManager.class);
 
@@ -140,6 +145,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
     private final Map<TableBucket, KvTablet> currentKvs = new ConcurrentHashMap<>();
 
+    private final Map<TableBucket, Object> kvLocks = new ConcurrentHashMap<>();
+
     /**
      * For arrow log format. The buffer allocator to allocate memory for arrow write batch of
      * changelog records.
@@ -148,10 +155,6 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
     /** The memory segment pool to allocate memorySegment. */
     private final LazyMemorySegmentPool memorySegmentPool;
-
-    private final FsPath remoteKvDir;
-
-    private final FileSystem remoteFileSystem;
 
     /**
      * The shared rate limiter for all RocksDB instances to control flush and compaction write rate.
@@ -185,14 +188,18 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             Clock clock)
             throws IOException {
         super(TabletType.KV, localDiskManager.dataDirs(), conf, recoveryThreadsPerDataDir);
+        RocksDBResourceContainer.validateConfiguration(conf);
+        if (conf.get(ConfigOptions.KV_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE)
+                && conf.get(ConfigOptions.KV_COMPACTION_STYLE)
+                        != ConfigOptions.CompactionStyle.LEVEL) {
+            LOG.warn("RocksDB L0 metadata pinning is recommended only for LEVEL compaction.");
+        }
         this.localDiskManager = localDiskManager;
         this.logManager = logManager;
         this.arrowBufferAllocator = BufferAllocatorUtil.createBufferAllocator(null);
         this.memorySegmentPool = LazyMemorySegmentPool.createServerBufferPool(conf);
         this.zkClient = zkClient;
         this.clock = clock;
-        this.remoteKvDir = FlussPaths.remoteKvDir(conf);
-        this.remoteFileSystem = remoteKvDir.getFileSystem();
         this.serverMetricGroup = tabletServerMetricGroup;
         this.sharedRocksDBRateLimiter = createSharedRateLimiter(conf);
         this.sharedBlockCache = createSharedBlockCache(conf);
@@ -268,7 +275,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             return null;
         }
         RocksDB.loadLibrary();
-        return new LRUCache(sharedBlockCacheSize);
+        // Let HyperClockCache size its table automatically and choose its default shard count.
+        return new HyperClockCache(sharedBlockCacheSize, 0, -1, false);
     }
 
     public static KvManager create(
@@ -551,8 +559,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             ArrowCompressionInfo arrowCompressionInfo,
             @Nullable Runnable flushCompleteListener)
             throws Exception {
-        return inLock(
-                tabletCreationOrDeletionLock,
+        return inKvLock(
+                tableBucket,
                 () -> {
                     if (currentKvs.containsKey(tableBucket)) {
                         return currentKvs.get(tableBucket);
@@ -626,9 +634,16 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     }
 
     public void dropKv(TableBucket tableBucket) {
-        KvTablet dropKvTablet =
-                inLock(tabletCreationOrDeletionLock, () -> currentKvs.remove(tableBucket));
+        inKvLock(
+                tableBucket,
+                () -> {
+                    doDropKv(tableBucket);
+                    return null;
+                });
+    }
 
+    private void doDropKv(TableBucket tableBucket) {
+        KvTablet dropKvTablet = currentKvs.remove(tableBucket);
         if (dropKvTablet != null) {
             TablePath tablePath = dropKvTablet.getTablePath();
             try {
@@ -665,6 +680,38 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         Tuple2<PhysicalTablePath, TableBucket> pathAndBucket = FlussPaths.parseTabletDir(tabletDir);
         PhysicalTablePath physicalTablePath = pathAndBucket.f0;
         TableBucket tableBucket = pathAndBucket.f1;
+        return inKvLock(
+                tableBucket,
+                () ->
+                        doLoadKv(
+                                tabletDir,
+                                physicalTablePath,
+                                tableBucket,
+                                schemaGetter,
+                                flushCompleteListener));
+    }
+
+    private KvTablet doLoadKv(
+            File tabletDir,
+            PhysicalTablePath physicalTablePath,
+            TableBucket tableBucket,
+            SchemaGetter schemaGetter,
+            @Nullable Runnable flushCompleteListener)
+            throws Exception {
+        KvTablet currentKv = currentKvs.get(tableBucket);
+        if (currentKv != null) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Duplicate kv tablet directories for bucket %s are found in both %s and %s. "
+                                    + "Recover server from this "
+                                    + "failure by manually deleting one of the two kv directories for this bucket. "
+                                    + "It is recommended to delete the bucket in the kv tablet directory that is "
+                                    + "known to have failed recently.",
+                            tableBucket,
+                            tabletDir.getAbsolutePath(),
+                            currentKv.getKvTabletDir().getAbsolutePath()));
+        }
+
         // get the log tablet for the kv tablet
         LogTablet logTablet =
                 logManager
@@ -714,30 +761,19 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         autoIncrementManager,
                         clock,
                         tableConfig);
-        if (this.currentKvs.containsKey(tableBucket)) {
-            throw new IllegalStateException(
-                    String.format(
-                            "Duplicate kv tablet directories for bucket %s are found in both %s and %s. "
-                                    + "Recover server from this "
-                                    + "failure by manually deleting one of the two kv directories for this bucket. "
-                                    + "It is recommended to delete the bucket in the kv tablet directory that is "
-                                    + "known to have failed recently.",
-                            tableBucket,
-                            tabletDir.getAbsolutePath(),
-                            currentKvs.get(tableBucket).getKvTabletDir().getAbsolutePath()));
-        }
-        this.currentKvs.put(tableBucket, kvTablet);
+        currentKvs.put(tableBucket, kvTablet);
 
         return kvTablet;
     }
 
     public void deleteRemoteKvSnapshot(
-            PhysicalTablePath physicalTablePath, TableBucket tableBucket) {
+            String remoteDataDir, PhysicalTablePath physicalTablePath, TableBucket tableBucket) {
         FsPath remoteKvTabletDir =
-                FlussPaths.remoteKvTabletDir(remoteKvDir, physicalTablePath, tableBucket);
+                FlussPaths.remoteKvTabletDir(
+                        FlussPaths.remoteKvDir(remoteDataDir), physicalTablePath, tableBucket);
         try {
-            if (remoteFileSystem.exists(remoteKvTabletDir)) {
-                remoteFileSystem.delete(remoteKvTabletDir, true);
+            if (remoteKvTabletDir.getFileSystem().exists(remoteKvTabletDir)) {
+                remoteKvTabletDir.getFileSystem().delete(remoteKvTabletDir, true);
                 LOG.info("Delete table's remote bucket snapshot dir of {} success.", tableBucket);
             }
         } catch (Exception e) {
@@ -748,8 +784,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         }
     }
 
-    // ============ ServerReconfigurable Implementation ============
-
+    // ============ ServerReconfigurable Implementation =====
     @Override
     public void validate(Configuration newConfig) throws ConfigException {
         // Config validation is already handled by KvConfigValidator which is registered
@@ -797,5 +832,15 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             throw new ConfigException(
                     "Failed to reconfigure shared RocksDB rate limiter: " + e.getMessage(), e);
         }
+    }
+
+    @VisibleForTesting
+    boolean hasKvLock(TableBucket tableBucket) {
+        return kvLocks.containsKey(tableBucket);
+    }
+
+    private <T, E extends Exception> T inKvLock(
+            TableBucket tableBucket, SupplierWithException<T, E> action) throws E {
+        return inTabletLock(tableBucket, kvLocks, currentKvs, action);
     }
 }

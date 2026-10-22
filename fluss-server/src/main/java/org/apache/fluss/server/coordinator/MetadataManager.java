@@ -39,6 +39,7 @@ import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
 import org.apache.fluss.metadata.DatabaseSummary;
+import org.apache.fluss.metadata.KafkaTableSchema;
 import org.apache.fluss.metadata.LakeTableUtil;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
@@ -123,12 +124,13 @@ public class MetadataManager {
         this.lakeCatalogDynamicLoader = lakeCatalogDynamicLoader;
     }
 
-    /** Validates the table descriptor. */
-    public void validateTableDescriptor(TableDescriptor tableDescriptor) {
+    /** Validates a descriptor and its Kafka topic identity before persistence. */
+    public void validateTableDescriptor(TablePath tablePath, TableDescriptor tableDescriptor) {
         TableDescriptorValidation.validateTableDescriptor(
                 tableDescriptor,
                 maxBucketNum,
                 lakeCatalogDynamicLoader.getLakeCatalogContainer().getDataLakeFormat());
+        KafkaTableSchema.validateTablePath(tablePath, tableDescriptor);
     }
 
     public void createDatabase(
@@ -303,6 +305,19 @@ public class MetadataManager {
             TablePath tablePath, ResolvedPartitionSpec partitionFilter)
             throws TableNotExistException, TableNotPartitionedException, InvalidPartitionException {
         TableInfo tableInfo = getTable(tablePath);
+        return listPartitions(tablePath, tableInfo, partitionFilter);
+    }
+
+    /**
+     * List the partitions of the given table and partition spec using the provided table metadata.
+     *
+     * @return a map from partition name to partition registration.
+     */
+    public Map<String, PartitionRegistration> listPartitions(
+            TablePath tablePath,
+            TableInfo tableInfo,
+            @Nullable ResolvedPartitionSpec partitionFilter)
+            throws TableNotExistException, TableNotPartitionedException, InvalidPartitionException {
         if (!tableInfo.isPartitioned()) {
             throw new TableNotPartitionedException(
                     "Table '" + tablePath + "' is not a partitioned table.");
@@ -315,6 +330,8 @@ public class MetadataManager {
                 return zookeeperClient.getPartitionRegistrations(
                         tablePath, tableInfo.getPartitionKeys(), partitionFilter);
             }
+        } catch (InvalidPartitionException e) {
+            throw e;
         } catch (Exception e) {
             throw new FlussRuntimeException(
                     String.format(
@@ -837,7 +854,7 @@ public class MetadataManager {
             }
 
             // reuse the same validate logic with the createTable() method
-            validateTableDescriptor(newDescriptor);
+            validateTableDescriptor(tablePath, newDescriptor);
 
             beforeUpdate.accept(tableInfo, newDescriptor);
 

@@ -72,6 +72,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
@@ -80,7 +81,9 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.server.coordinator.statemachine.BucketState.OnlineBucket;
+import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.OfflineReplica;
 import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.OnlineReplica;
+import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.ReplicaDeletionIneligible;
 import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.ReplicaDeletionStarted;
 import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.ReplicaDeletionSuccessful;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
@@ -250,6 +253,97 @@ class TableManagerTest {
                 () -> assertThat(zookeeperClient.getTableAssignment(tableId)).isEmpty());
         // the table will also be removed from coordinator context
         assertThat(coordinatorContext.getAllReplicasForTable(tableId)).isEmpty();
+    }
+
+    @Test
+    void testResumeReplicaDeletionAfterTabletServerRestarts() throws Exception {
+        long tableId = zookeeperClient.getTableIdAndIncrement();
+        TableAssignment assignment = createAssignment();
+        zookeeperClient.registerTableAssignment(tableId, assignment);
+
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        DATA1_TABLE_PATH,
+                        tableId,
+                        0,
+                        DATA1_TABLE_DESCRIPTOR,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+        tableManager.onCreateNewTable(DATA1_TABLE_PATH, tableId, assignment);
+
+        int offlineServerId = 0;
+        coordinatorContext.removeLiveTabletServer(offlineServerId);
+
+        Set<TableBucketReplica> allReplicas = getReplicas(tableId, assignment);
+        Set<TableBucketReplica> replicasOnOfflineServer = new HashSet<>();
+        Set<TableBucketReplica> replicasOnOnlineServers = new HashSet<>();
+        for (TableBucketReplica replica : allReplicas) {
+            if (replica.getReplica() == offlineServerId) {
+                replicasOnOfflineServer.add(replica);
+            } else {
+                replicasOnOnlineServers.add(replica);
+            }
+        }
+        replicasOnOfflineServer.forEach(
+                replica -> coordinatorContext.putReplicaState(replica, OfflineReplica));
+        // An offline replica on a live tablet server can still receive a delete request and must
+        // not be treated as deletion ineligible.
+        coordinatorContext.putReplicaState(
+                replicasOnOnlineServers.iterator().next(), OfflineReplica);
+
+        coordinatorContext.queueTableDeletion(Collections.singleton(tableId));
+        tableManager.onDeleteTable(tableId);
+
+        assertThat(replicasOnOfflineServer)
+                .allSatisfy(
+                        replica ->
+                                assertThat(coordinatorContext.getReplicaState(replica))
+                                        .isEqualTo(ReplicaDeletionIneligible));
+        assertThat(replicasOnOnlineServers)
+                .allSatisfy(
+                        replica ->
+                                assertThat(coordinatorContext.getReplicaState(replica))
+                                        .isEqualTo(ReplicaDeletionStarted));
+        assertThat(collectSuccessfullyDeletedReplicas()).isEqualTo(replicasOnOnlineServers);
+
+        int failedDuringDeletionServerId = 1;
+        Set<TableBucketReplica> replicasOnFailedDuringDeletionServer =
+                replicasOnOnlineServers.stream()
+                        .filter(replica -> replica.getReplica() == failedDuringDeletionServerId)
+                        .collect(Collectors.toSet());
+        coordinatorContext.removeLiveTabletServer(failedDuringDeletionServerId);
+        tableManager.failReplicaDeletion(failedDuringDeletionServerId);
+        assertThat(replicasOnFailedDuringDeletionServer)
+                .allSatisfy(
+                        replica ->
+                                assertThat(coordinatorContext.getReplicaState(replica))
+                                        .isEqualTo(ReplicaDeletionIneligible));
+
+        coordinatorContext.addLiveTabletServer(
+                CoordinatorTestUtils.createServers(
+                                Collections.singletonList(failedDuringDeletionServerId))
+                        .get(0));
+        tableManager.resumeReplicaDeletion(failedDuringDeletionServerId);
+        assertThat(replicasOnFailedDuringDeletionServer)
+                .allSatisfy(
+                        replica ->
+                                assertThat(coordinatorContext.getReplicaState(replica))
+                                        .isEqualTo(ReplicaDeletionStarted));
+
+        coordinatorContext.addLiveTabletServer(
+                CoordinatorTestUtils.createServers(Collections.singletonList(offlineServerId))
+                        .get(0));
+        tableManager.resumeReplicaDeletion(offlineServerId);
+
+        assertThat(replicasOnOfflineServer)
+                .allSatisfy(
+                        replica ->
+                                assertThat(coordinatorContext.getReplicaState(replica))
+                                        .isEqualTo(ReplicaDeletionStarted));
+        assertThat(collectSuccessfullyDeletedReplicas()).isEqualTo(allReplicas);
+
+        zookeeperClient.deleteTableAssignment(tableId);
     }
 
     @Test
@@ -497,24 +591,6 @@ class TableManagerTest {
 
     private void checkReplicaDelete(
             long tableId, @Nullable Long partitionId, TableAssignment assignment) {
-        // collect all the delete success event
-        Set<DeleteReplicaResponseReceivedEvent> deleteReplicaSuccessEvents =
-                collectDeleteReplicaSuccessEvents();
-        Set<TableBucketReplica> deleteTableBucketReplicas = new HashSet<>();
-        // get all the delete success replicas from the delete success event
-        for (DeleteReplicaResponseReceivedEvent deleteReplicaResponseReceivedEvent :
-                deleteReplicaSuccessEvents) {
-            List<DeleteReplicaResultForBucket> deleteReplicaResultForBuckets =
-                    deleteReplicaResponseReceivedEvent.getDeleteReplicaResults();
-            for (DeleteReplicaResultForBucket deleteReplicaResultForBucket :
-                    deleteReplicaResultForBuckets) {
-                if (deleteReplicaResultForBucket.succeeded()) {
-                    deleteTableBucketReplicas.add(
-                            deleteReplicaResultForBucket.getTableBucketReplica());
-                }
-            }
-        }
-
         // get all the expected delete success replicas
         Set<TableBucketReplica> expectedDeleteTableBucketReplicas = new HashSet<>();
         for (int bucketId : assignment.getBuckets()) {
@@ -524,7 +600,8 @@ class TableManagerTest {
                 expectedDeleteTableBucketReplicas.add(new TableBucketReplica(tableBucket, replica));
             }
         }
-        assertThat(deleteTableBucketReplicas).isEqualTo(expectedDeleteTableBucketReplicas);
+        assertThat(collectSuccessfullyDeletedReplicas())
+                .isEqualTo(expectedDeleteTableBucketReplicas);
     }
 
     private Set<TableBucketReplica> getReplicas(long tableId, TableAssignment assignment) {
@@ -635,6 +712,18 @@ class TableManagerTest {
             }
             return super.stopReplica(request);
         }
+    }
+
+    private Set<TableBucketReplica> collectSuccessfullyDeletedReplicas() {
+        Set<TableBucketReplica> deletedReplicas = new HashSet<>();
+        for (DeleteReplicaResponseReceivedEvent event : collectDeleteReplicaSuccessEvents()) {
+            for (DeleteReplicaResultForBucket result : event.getDeleteReplicaResults()) {
+                if (result.succeeded()) {
+                    deletedReplicas.add(result.getTableBucketReplica());
+                }
+            }
+        }
+        return deletedReplicas;
     }
 
     /**

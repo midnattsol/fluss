@@ -18,7 +18,6 @@
 package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.config.ConfigOptions;
-import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -57,9 +56,6 @@ public interface SnapshotContext {
     /** Get the size of the write buffer for writing the kv snapshot file to remote filesystem. */
     int getSnapshotFsWriteBufferSize();
 
-    /** Get the remote root path to store kv snapshot files. */
-    FsPath getRemoteKvDir();
-
     /**
      * Get the provider of latest CompletedSnapshot for a table bucket. When no completed snapshot
      * exists, the CompletedSnapshot provided will be null.
@@ -92,7 +88,8 @@ public interface SnapshotContext {
      * @throws Exception if discovering the remote snapshots failed
      */
     default Optional<CompletedSnapshot> getLatestRemoteSnapshot(
-            PhysicalTablePath physicalPath, TableBucket tableBucket) throws Exception {
+            PhysicalTablePath physicalPath, TableBucket tableBucket, String remoteDataDir)
+            throws Exception {
         return Optional.empty();
     }
 

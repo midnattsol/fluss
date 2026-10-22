@@ -91,8 +91,6 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
 
     private final int remoteLogDownloadThreadsInRecoverKv;
 
-    private final FsPath remoteKvDir;
-
     private DefaultSnapshotContext(
             ZooKeeperClient zooKeeperClient,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
@@ -102,7 +100,6 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             KvSnapshotDataDownloader kvSnapshotDataDownloader,
             long kvSnapshotIntervalMs,
             int writeBufferSizeInBytes,
-            FsPath remoteKvDir,
             CompletedSnapshotHandleStore completedSnapshotHandleStore,
             KvSnapshotLeaseMetadataManager leaseMetadataManager,
             @Nullable CoordinatorGateway coordinatorGateway,
@@ -118,7 +115,6 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
         this.kvSnapshotDataDownloader = kvSnapshotDataDownloader;
         this.kvSnapshotIntervalMs = kvSnapshotIntervalMs;
         this.writeBufferSizeInBytes = writeBufferSizeInBytes;
-        this.remoteKvDir = remoteKvDir;
 
         this.completedSnapshotHandleStore = completedSnapshotHandleStore;
         this.leaseMetadataManager = leaseMetadataManager;
@@ -144,7 +140,6 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
                 kvSnapshotResource.getKvSnapshotDataDownloader(),
                 conf.get(ConfigOptions.KV_SNAPSHOT_INTERVAL).toMillis(),
                 (int) conf.get(ConfigOptions.REMOTE_FS_WRITE_BUFFER_SIZE).getBytes(),
-                FlussPaths.remoteKvDir(conf),
                 new ZooKeeperCompletedSnapshotHandleStore(zkClient),
                 new KvSnapshotLeaseMetadataManager(
                         zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR)),
@@ -155,14 +150,17 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
                 conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_DOWNLOAD_THREADS));
     }
 
+    @Override
     public ZooKeeperClient getZooKeeperClient() {
         return zooKeeperClient;
     }
 
+    @Override
     public ExecutorService getAsyncOperationsThreadPool() {
         return asyncOperationsThreadPool;
     }
 
+    @Override
     public KvSnapshotDataUploader getSnapshotDataUploader() {
         return kvSnapshotDataUploader;
     }
@@ -172,6 +170,7 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
         return kvSnapshotDataDownloader;
     }
 
+    @Override
     public ScheduledExecutorService getSnapshotScheduler() {
         return snapshotScheduler;
     }
@@ -189,10 +188,6 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
     @Override
     public int getSnapshotFsWriteBufferSize() {
         return writeBufferSizeInBytes;
-    }
-
-    public FsPath getRemoteKvDir() {
-        return remoteKvDir;
     }
 
     @Override
@@ -216,7 +211,8 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
 
     @Override
     public Optional<CompletedSnapshot> getLatestRemoteSnapshot(
-            PhysicalTablePath physicalPath, TableBucket tableBucket) throws Exception {
+            PhysicalTablePath physicalPath, TableBucket tableBucket, String remoteDataDir)
+            throws Exception {
         List<CompletedSnapshotHandle> handles =
                 completedSnapshotHandleStore.getAllCompletedSnapshotHandles(tableBucket);
         CompletedSnapshot latest = null;
@@ -242,7 +238,7 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
         // The ZK handle store can be empty while snapshot files still exist in remote storage
         // (e.g. ZK data loss, or handles cleaned while files remain). Fall back to listing the
         // bucket's remote snapshot directory before giving up.
-        return findLatestSnapshotInRemoteStorage(physicalPath, tableBucket);
+        return findLatestSnapshotInRemoteStorage(physicalPath, tableBucket, remoteDataDir);
     }
 
     /**
@@ -265,9 +261,11 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
      * @throws Exception if the remote directory itself cannot be accessed
      */
     private Optional<CompletedSnapshot> findLatestSnapshotInRemoteStorage(
-            PhysicalTablePath physicalPath, TableBucket tableBucket) throws Exception {
+            PhysicalTablePath physicalPath, TableBucket tableBucket, String remoteDataDir)
+            throws Exception {
         FsPath remoteTabletDir =
-                FlussPaths.remoteKvTabletDir(remoteKvDir, physicalPath, tableBucket);
+                FlussPaths.remoteKvTabletDir(
+                        FlussPaths.remoteKvDir(remoteDataDir), physicalPath, tableBucket);
         if (!remoteTabletDir.getFileSystem().exists(remoteTabletDir)) {
             return Optional.empty();
         }

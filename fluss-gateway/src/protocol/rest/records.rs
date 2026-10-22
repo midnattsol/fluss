@@ -1206,6 +1206,7 @@ mod tests {
                 num_leader_replicas: 3,
                 active_leader_replicas: 3,
                 status,
+                data_at_risk: Some(false),
             });
             let app = app(Arc::clone(&backend));
 
