@@ -324,6 +324,10 @@ pub struct ProduceLogRequest {
     pub timeout_ms: i32,
     #[prost(message, repeated, tag = "4")]
     pub buckets_req: ::prost::alloc::vec::Vec<PbProduceLogReqForBucket>,
+    /// Version 2: Required for recoverable appends; 1 = new send, 2 = retry. Unset preserves the
+    /// ordinary PRODUCE_LOG behavior. Clients must not downgrade a request carrying this field.
+    #[prost(int32, optional, tag = "5")]
+    pub recovery_mode: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProduceLogResponse {
