@@ -27,6 +27,7 @@ import org.apache.fluss.exception.ScannerExpiredException;
 import org.apache.fluss.exception.StaleMetadataException;
 import org.apache.fluss.exception.UnknownScannerIdException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -99,6 +100,7 @@ import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.FetchLogReadPreference;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.rpc.protocol.RecoverableWriteMode;
 import org.apache.fluss.security.acl.OperationType;
 import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.server.DynamicConfigManager;
@@ -238,6 +240,22 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
 
     @Override
     public CompletableFuture<ProduceLogResponse> produceLog(ProduceLogRequest request) {
+        int recoverableWriteMode = RecoverableWriteMode.NONE;
+        if (request.hasRecoveryMode()) {
+            if (currentSession().getApiVersion() < 2) {
+                throw new UnsupportedVersionException(
+                        "Recoverable writes require PRODUCE_LOG version 2 or newer");
+            }
+            recoverableWriteMode = request.getRecoveryMode();
+            if (!RecoverableWriteMode.isValid(recoverableWriteMode)) {
+                throw new UnsupportedVersionException(
+                        "Unsupported recoverable PRODUCE_LOG mode " + recoverableWriteMode);
+            }
+            if (hasHistoricalProduce(request)) {
+                throw new UnsupportedVersionException(
+                        "Recoverable writes are not supported for historical log writes");
+            }
+        }
         authorizeTable(WRITE, request.getTableId());
         long tableId = request.getTableId();
         Map<TableBucket, ProduceLogResultForBucket> routingErrors = new HashMap<>();
@@ -285,6 +303,7 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                     request.getAcks(),
                     recordsByBucket,
                     userContext,
+                    recoverableWriteMode,
                     responseCallback);
         }
         return response;

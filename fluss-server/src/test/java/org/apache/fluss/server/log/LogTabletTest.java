@@ -20,7 +20,9 @@ package org.apache.fluss.server.log;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
+import org.apache.fluss.exception.DuplicateSequenceException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.exception.UnknownWriterIdException;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -29,6 +31,7 @@ import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogTestBase;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.rpc.protocol.RecoverableWriteMode;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
@@ -687,6 +690,226 @@ final class LogTabletTest extends LogTestBase {
                                 "Out of order batch sequence for writer 1 at offset 25 in table-bucket "
                                         + "TableBucket{tableId=150001, bucket=%s} : 1 (incoming batch seq.), 6 (current batch seq.)",
                                 logTablet.getTableBucket().getBucket()));
+    }
+
+    @Test
+    void testRecoverableRetryRequiresRetainedWriterState() throws Exception {
+        long writerId = 77L;
+        MemoryLogRecords retry = genMemoryLogRecordsWithWriterId(DATA1, writerId, 0, 0L);
+
+        assertThatThrownBy(() -> logTablet.appendAsLeader(retry, RecoverableWriteMode.RETRY))
+                .isInstanceOf(UnknownWriterIdException.class)
+                .hasMessageContaining("unknown or expired writer 77");
+        assertThat(logTablet.localLogEndOffset()).isZero();
+    }
+
+    @Test
+    void testRecoverableRetryOnlyAcknowledgesTheSameBatch() throws Exception {
+        long writerId = 78L;
+        List<Object[]> initialRows = Collections.singletonList(new Object[] {1, "initial"});
+        LogAppendInfo initial =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(initialRows, writerId, 0, 0L),
+                        RecoverableWriteMode.NEW_SEND);
+        long logEndOffset = logTablet.localLogEndOffset();
+
+        LogAppendInfo retry =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(initialRows, writerId, 0, 0L),
+                        RecoverableWriteMode.RETRY);
+        assertThat(retry.firstOffset()).isEqualTo(initial.firstOffset());
+        assertThat(retry.lastOffset()).isEqualTo(initial.lastOffset());
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(logEndOffset);
+
+        List<Object[]> changedRows = Collections.singletonList(new Object[] {1, "changed"});
+        assertThatThrownBy(
+                        () ->
+                                logTablet.appendAsLeader(
+                                        genMemoryLogRecordsWithWriterId(
+                                                changedRows, writerId, 0, 0L),
+                                        RecoverableWriteMode.RETRY))
+                .isInstanceOf(DuplicateSequenceException.class)
+                .hasMessageContaining("payload differs");
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(logEndOffset);
+    }
+
+    @Test
+    void testRecoverableRetryAppendsKnownWritersNextSequence() throws Exception {
+        long writerId = 80L;
+        List<Object[]> firstRows = Collections.singletonList(new Object[] {1, "acknowledged"});
+        logTablet.appendAsLeader(
+                genMemoryLogRecordsWithWriterId(firstRows, writerId, 0, 0L),
+                RecoverableWriteMode.NEW_SEND);
+
+        List<Object[]> nextRows = Collections.singletonList(new Object[] {2, "prepared-not-sent"});
+        LogAppendInfo firstAttempt =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(nextRows, writerId, 1, 0L),
+                        RecoverableWriteMode.RETRY);
+        long endOffset = logTablet.localLogEndOffset();
+        LogAppendInfo replay =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(nextRows, writerId, 1, 0L),
+                        RecoverableWriteMode.RETRY);
+
+        assertThat(firstAttempt.firstOffset()).isEqualTo(replay.firstOffset());
+        assertThat(firstAttempt.lastOffset()).isEqualTo(replay.lastOffset());
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(endOffset);
+        assertThat(endOffset).isEqualTo(firstAttempt.lastOffset() + 1);
+    }
+
+    @Test
+    void testRecoverableRetryUnknownWriterNonzeroSequenceFailsClosed() throws Exception {
+        assertThatThrownBy(
+                        () ->
+                                logTablet.appendAsLeader(
+                                        genMemoryLogRecordsWithWriterId(DATA1, 81L, 5, 0L),
+                                        RecoverableWriteMode.RETRY))
+                .isInstanceOf(UnknownWriterIdException.class);
+        assertThat(logTablet.localLogEndOffset()).isZero();
+    }
+
+    @Test
+    void testRecoverableRetrySequenceWrapsFromMaxValueToZero() throws Exception {
+        long writerId = 82L;
+        WriterAppendInfo restoredWriterState =
+                logTablet.writerStateManager().prepareUpdate(writerId);
+        restoredWriterState.appendDataBatch(
+                Integer.MAX_VALUE, new LogOffsetMetadata(0L), 0L, true, true, 0L);
+        logTablet.writerStateManager().update(restoredWriterState);
+
+        List<Object[]> zeroRows = Collections.singletonList(new Object[] {2, "wrapped-zero"});
+        LogAppendInfo zeroAppend =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(zeroRows, writerId, 0, 0L),
+                        RecoverableWriteMode.RETRY);
+        long endAfterZero = logTablet.localLogEndOffset();
+        LogAppendInfo zeroReplay =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(zeroRows, writerId, 0, 0L),
+                        RecoverableWriteMode.RETRY);
+
+        assertThat(zeroAppend.firstOffset()).isZero();
+        assertThat(zeroReplay.firstOffset()).isEqualTo(zeroAppend.firstOffset());
+        assertThat(zeroReplay.lastOffset()).isEqualTo(zeroAppend.lastOffset());
+        assertThat(endAfterZero).isEqualTo(zeroAppend.lastOffset() + 1);
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(endAfterZero);
+    }
+
+    @Test
+    void testRecoverableRetryAfterWriterStateReload() throws Exception {
+        long writerId = 79L;
+        List<Object[]> rows = Collections.singletonList(new Object[] {1, "persisted"});
+        LogAppendInfo firstSend =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                        RecoverableWriteMode.NEW_SEND);
+        logTablet.flush(true);
+        takeWriterSnapshot(logTablet);
+        logTablet.close();
+
+        logTablet =
+                LogTablet.create(
+                        tempDir,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH),
+                        logDir,
+                        conf,
+                        new AtomicBoolean(
+                                conf.get(ConfigOptions.LOG_RETENTION_ROLL_ACTIVE_SEGMENT_ENABLED)),
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        0,
+                        scheduler,
+                        LogFormat.ARROW,
+                        1,
+                        false,
+                        SystemClock.getInstance(),
+                        true);
+
+        LogAppendInfo retry =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                        RecoverableWriteMode.RETRY);
+        assertThat(retry.firstOffset()).isEqualTo(firstSend.firstOffset());
+        assertThat(retry.lastOffset()).isEqualTo(firstSend.lastOffset());
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(firstSend.lastOffset() + 1);
+    }
+
+    @Test
+    void testRecoverableRetryAfterUncleanRebuild() throws Exception {
+        long writerId = 83L;
+        List<Object[]> rows = Collections.singletonList(new Object[] {1, "unclean-rebuild"});
+        LogAppendInfo firstSend =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                        RecoverableWriteMode.NEW_SEND);
+        long endOffset = logTablet.localLogEndOffset();
+        logTablet.close();
+
+        logTablet =
+                LogTablet.create(
+                        tempDir,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH),
+                        logDir,
+                        conf,
+                        new AtomicBoolean(
+                                conf.get(ConfigOptions.LOG_RETENTION_ROLL_ACTIVE_SEGMENT_ENABLED)),
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        0,
+                        scheduler,
+                        LogFormat.ARROW,
+                        1,
+                        false,
+                        SystemClock.getInstance(),
+                        false);
+
+        LogAppendInfo retry =
+                logTablet.appendAsLeader(
+                        genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                        RecoverableWriteMode.RETRY);
+        assertThat(retry.firstOffset()).isEqualTo(firstSend.firstOffset());
+        assertThat(retry.lastOffset()).isEqualTo(firstSend.lastOffset());
+        assertThat(retry.duplicated()).isTrue();
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(endOffset);
+    }
+
+    @Test
+    void testRecoverableRetryAfterWriterExpirationFailsClosed() throws Exception {
+        long writerId = 84L;
+        List<Object[]> rows = Collections.singletonList(new Object[] {1, "expired-writer"});
+        logTablet.appendAsLeader(
+                genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                RecoverableWriteMode.NEW_SEND);
+        long endOffset = logTablet.localLogEndOffset();
+        logTablet.removeExpiredWriter(Long.MAX_VALUE);
+
+        assertThatThrownBy(
+                        () ->
+                                logTablet.appendAsLeader(
+                                        genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                                        RecoverableWriteMode.RETRY))
+                .isInstanceOf(UnknownWriterIdException.class);
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(endOffset);
+    }
+
+    @Test
+    void testRecoverableRetryAfterRetainedRecordTruncationFailsClosed() throws Exception {
+        long writerId = 85L;
+        List<Object[]> rows = Collections.singletonList(new Object[] {1, "truncated-record"});
+        logTablet.appendAsLeader(
+                genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                RecoverableWriteMode.NEW_SEND);
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(1L);
+
+        assertThat(logTablet.truncateTo(0L)).isTrue();
+        long endOffset = logTablet.localLogEndOffset();
+
+        assertThatThrownBy(
+                        () ->
+                                logTablet.appendAsLeader(
+                                        genMemoryLogRecordsWithWriterId(rows, writerId, 0, 0L),
+                                        RecoverableWriteMode.RETRY))
+                .isInstanceOf(UnknownWriterIdException.class);
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(endOffset);
     }
 
     private LogTablet createLogTablet(Configuration config) throws Exception {

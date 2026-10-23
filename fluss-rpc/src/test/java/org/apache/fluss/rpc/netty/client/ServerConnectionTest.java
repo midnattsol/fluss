@@ -368,6 +368,32 @@ public class ServerConnectionTest {
         }
     }
 
+    @Test
+    void testRejectRecoverableWritesForOldServer() throws Exception {
+        nettyServer.close();
+        OldWriteGatewayService oldWriteGatewayService = new OldWriteGatewayService();
+        buildNettyServer(oldWriteGatewayService);
+        ServerConnection connection =
+                new ServerConnection(
+                        bootstrap,
+                        serverNode,
+                        TestingClientMetricGroup.newInstance(),
+                        clientAuthenticator,
+                        (con, ignore) -> {});
+        try {
+            ProduceLogRequest request = produceLogRequest(null).setRecoveryMode(2);
+            assertThatThrownBy(() -> connection.send(ApiKeys.PRODUCE_LOG, request).get())
+                    .rootCause()
+                    .isInstanceOf(UnsupportedVersionException.class)
+                    .hasMessageContaining("require PRODUCE_LOG version 2 or newer")
+                    .hasMessageContaining("negotiated version 0");
+
+            assertThat(oldWriteGatewayService.produceLogCalls).isZero();
+        } finally {
+            connection.close().get();
+        }
+    }
+
     private static PutKvRequest putKvRequest(String originalPartitionName) {
         PutKvRequest request = new PutKvRequest().setTableId(1L).setAcks(1).setTimeoutMs(10_000);
         request.addBucketsReq().setBucketId(0).setRecords(new byte[0]);
@@ -416,6 +442,8 @@ public class ServerConnectionTest {
     }
 
     private static class OldWriteGatewayService extends TestingTabletGatewayService {
+        private int produceLogCalls;
+
         @Override
         public CompletableFuture<ApiVersionsResponse> apiVersions(ApiVersionsRequest request) {
             return super.apiVersions(request)
@@ -439,6 +467,7 @@ public class ServerConnectionTest {
 
         @Override
         public CompletableFuture<ProduceLogResponse> produceLog(ProduceLogRequest request) {
+            produceLogCalls++;
             return CompletableFuture.completedFuture(new ProduceLogResponse());
         }
     }

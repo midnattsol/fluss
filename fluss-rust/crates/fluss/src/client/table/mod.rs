@@ -30,6 +30,7 @@ mod lookup;
 
 mod log_fetch_buffer;
 mod partition_getter;
+mod prepared_log_batch;
 mod read_context_resolver;
 mod reader;
 mod remote_log;
@@ -39,6 +40,7 @@ mod upsert;
 pub use append::{AppendWriter, TableAppend};
 pub use batch_scanner::LimitBatchScanner;
 pub use lookup::{LookupResult, Lookuper, PrefixKeyLookuper, TableLookup, TablePrefixLookup};
+pub use prepared_log_batch::{PreparedLogBatch, PreparedLogBatchResult, RecoverableWriteMode};
 pub use reader::{
     BoundedCollectOutcome, BoundedLogReadRange, RecordBatchLogReader, RecordBatchReadOutcome,
     SyncRecordBatchLogReader,

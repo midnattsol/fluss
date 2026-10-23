@@ -133,8 +133,8 @@ impl ApiKey {
             }
             // AlterTable v1 adds modify_bucket_count.
             ApiKey::AlterTable => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(1))),
-            // ProduceLog v1 adds historical partition context to requests and responses.
-            ApiKey::ProduceLog => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(1))),
+            // ProduceLog v1 adds historical partition context; v2 adds recovery mode.
+            ApiKey::ProduceLog => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(2))),
             // PutKv v2 adds the storage backpressure error code; v3 adds historical partition
             // context to requests and responses.
             ApiKey::PutKv => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(3))),

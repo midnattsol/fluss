@@ -75,6 +75,7 @@ import static org.apache.fluss.utils.IOUtils.closeQuietly;
 final class ServerConnection {
     private static final Logger LOG = LoggerFactory.getLogger(ServerConnection.class);
     private static final short HISTORICAL_PRODUCE_LOG_MIN_VERSION = 1;
+    private static final short RECOVERABLE_PRODUCE_LOG_MIN_VERSION = 2;
     private static final short HISTORICAL_PUT_KV_MIN_VERSION = 3;
     private static final short ALTER_BUCKET_COUNT_MIN_VERSION = 1;
 
@@ -385,6 +386,20 @@ final class ServerConnection {
 
     @VisibleForTesting
     void validateVersionCompatibility(ApiKeys apiKey, short version, ApiMessage rawRequest) {
+        if (apiKey == ApiKeys.PRODUCE_LOG && version < RECOVERABLE_PRODUCE_LOG_MIN_VERSION) {
+            ProduceLogRequest produceLogRequest = (ProduceLogRequest) rawRequest;
+            if (produceLogRequest.hasRecoveryMode()) {
+                throw new UnsupportedVersionException(
+                        "Recoverable writes require PRODUCE_LOG version "
+                                + RECOVERABLE_PRODUCE_LOG_MIN_VERSION
+                                + " or newer, but server "
+                                + node
+                                + " negotiated version "
+                                + version
+                                + '.');
+            }
+        }
+
         if (apiKey == ApiKeys.PRODUCE_LOG && version < HISTORICAL_PRODUCE_LOG_MIN_VERSION) {
             ProduceLogRequest produceLogRequest = (ProduceLogRequest) rawRequest;
             if (hasHistoricalProduce(produceLogRequest)) {

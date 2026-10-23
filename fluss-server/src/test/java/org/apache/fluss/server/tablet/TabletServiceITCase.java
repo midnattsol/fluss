@@ -55,12 +55,14 @@ import org.apache.fluss.rpc.messages.PbNotifyLeaderAndIsrReqForBucket;
 import org.apache.fluss.rpc.messages.PbPrefixLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PbTableStatsRespForBucket;
+import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.messages.ScanKvRequest;
 import org.apache.fluss.rpc.messages.ScanKvResponse;
 import org.apache.fluss.rpc.messages.StopReplicaRequest;
 import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.rpc.protocol.RecoverableWriteMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
 import org.apache.fluss.server.log.ListOffsetsParam;
@@ -129,6 +131,7 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeUpdateMeta
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
+import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -189,6 +192,116 @@ public class TabletServiceITCase {
                 .cause()
                 .isInstanceOf(InvalidRequiredAcksException.class)
                 .hasMessageContaining("Invalid required acks");
+    }
+
+    @Test
+    void testRecoverableProduceLogRetriesOnlyTheSameBatch() throws Exception {
+        long tableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tableBucket);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tableBucket);
+        TabletServerGateway leaderGateway =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+        long writerId = 900L;
+        List<Object[]> originalRows = Collections.singletonList(new Object[] {1, "original"});
+
+        ProduceLogRequest firstSend =
+                newProduceLogRequest(
+                                tableId,
+                                0,
+                                1,
+                                genMemoryLogRecordsWithWriterId(originalRows, writerId, 0, 0L))
+                        .setRecoveryMode(RecoverableWriteMode.NEW_SEND);
+        assertProduceLogResponse(leaderGateway.produceLog(firstSend).get(), 0, 0L);
+
+        // Reopen the tablet server from its on-disk log before replaying the caller-retained batch.
+        FLUSS_CLUSTER_EXTENSION.restartTabletServer(
+                leader, new org.apache.fluss.config.Configuration());
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tableBucket);
+        leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tableBucket);
+        leaderGateway = FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        ProduceLogRequest retry =
+                newProduceLogRequest(
+                                tableId,
+                                0,
+                                1,
+                                genMemoryLogRecordsWithWriterId(originalRows, writerId, 0, 0L))
+                        .setRecoveryMode(RecoverableWriteMode.RETRY);
+        assertProduceLogResponse(leaderGateway.produceLog(retry).get(), 0, 0L);
+
+        List<Object[]> changedRows = Collections.singletonList(new Object[] {1, "changed"});
+        ProduceLogRequest changedRetry =
+                newProduceLogRequest(
+                                tableId,
+                                0,
+                                1,
+                                genMemoryLogRecordsWithWriterId(changedRows, writerId, 0, 0L))
+                        .setRecoveryMode(RecoverableWriteMode.RETRY);
+        ProduceLogResponse changedRetryResponse = leaderGateway.produceLog(changedRetry).get();
+        assertThat(changedRetryResponse.getBucketsRespsList().get(0).getErrorCode())
+                .isEqualTo(Errors.DUPLICATE_SEQUENCE_EXCEPTION.code());
+        assertThat(changedRetryResponse.getBucketsRespsList().get(0).getErrorMessage())
+                .contains("payload differs");
+
+        ProduceLogResponse unknownWriterResponse =
+                leaderGateway
+                        .produceLog(
+                                newProduceLogRequest(
+                                                tableId,
+                                                0,
+                                                1,
+                                                genMemoryLogRecordsWithWriterId(
+                                                        originalRows, 999L, 0, 0L))
+                                        .setRecoveryMode(RecoverableWriteMode.RETRY))
+                        .get();
+        assertThat(unknownWriterResponse.getBucketsRespsList().get(0).getErrorCode())
+                .isEqualTo(Errors.UNKNOWN_WRITER_ID_EXCEPTION.code());
+    }
+
+    @Test
+    void testInvalidRecoverableModeRejectedBeforeAnyBucketMutation() throws Exception {
+        long tableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        TableBucket firstBucket = new TableBucket(tableId, 0);
+        TableBucket secondBucket = new TableBucket(tableId, 1);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(firstBucket);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(secondBucket);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(firstBucket);
+        TabletServerGateway gateway = FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+        ProduceLogRequest request =
+                newProduceLogRequest(
+                        tableId, 0, 1, genMemoryLogRecordsWithWriterId(DATA1, 901L, 0, 0L));
+        request.addAllBucketsReqs(
+                Collections.singletonList(
+                        newProduceLogRequest(
+                                        tableId,
+                                        1,
+                                        1,
+                                        genMemoryLogRecordsWithWriterId(DATA1, 902L, 0, 0L))
+                                .getBucketsReqAt(0)));
+        request.setRecoveryMode(99);
+        assertThatThrownBy(() -> gateway.produceLog(request).get())
+                .cause()
+                .isInstanceOf(org.apache.fluss.exception.UnsupportedVersionException.class);
+
+        for (TableBucket bucket : Arrays.asList(firstBucket, secondBucket)) {
+            int bucketLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(bucket);
+            TabletServerGateway bucketGateway =
+                    FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(bucketLeader);
+            ProduceLogRequest untouchedBatch =
+                    newProduceLogRequest(
+                                    tableId,
+                                    bucket.getBucket(),
+                                    1,
+                                    genMemoryLogRecordsWithWriterId(
+                                            DATA1, bucket.getBucket() == 0 ? 901L : 902L, 0, 0L))
+                            .setRecoveryMode(RecoverableWriteMode.NEW_SEND);
+            ProduceLogResponse response = bucketGateway.produceLog(untouchedBatch).get();
+            assertThat(response.getBucketsRespsList().get(0).hasErrorCode()).isFalse();
+            assertThat(response.getBucketsRespsList().get(0).getBaseOffset()).isZero();
+        }
     }
 
     @Test

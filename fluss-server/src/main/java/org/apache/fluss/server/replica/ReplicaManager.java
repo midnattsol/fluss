@@ -75,6 +75,7 @@ import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.rpc.protocol.RecoverableWriteMode;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.LakeBucketOffset;
@@ -703,6 +704,23 @@ public class ReplicaManager implements ServerReconfigurable {
             Map<TableBucket, MemoryLogRecords> entriesPerBucket,
             @Nullable UserContext userContext,
             Consumer<List<ProduceLogResultForBucket>> responseCallback) {
+        appendRecordsToLog(
+                timeoutMs,
+                requiredAcks,
+                entriesPerBucket,
+                userContext,
+                RecoverableWriteMode.NONE,
+                responseCallback);
+    }
+
+    /** Appends records with an optional recoverable-write mode. */
+    public void appendRecordsToLog(
+            int timeoutMs,
+            int requiredAcks,
+            Map<TableBucket, MemoryLogRecords> entriesPerBucket,
+            @Nullable UserContext userContext,
+            int recoverableWriteMode,
+            Consumer<List<ProduceLogResultForBucket>> responseCallback) {
         if (isRequiredAcksInvalid(requiredAcks)) {
             throw new InvalidRequiredAcksException("Invalid required acks: " + requiredAcks);
         }
@@ -710,7 +728,7 @@ public class ReplicaManager implements ServerReconfigurable {
 
         long startTime = System.currentTimeMillis();
         Map<TableBucket, ProduceLogResultForBucket> appendResult =
-                appendToLocalLog(entriesPerBucket, requiredAcks, userContext);
+                appendToLocalLog(entriesPerBucket, requiredAcks, userContext, recoverableWriteMode);
         LOG.debug("Append records to local log in {} ms", System.currentTimeMillis() - startTime);
 
         // maybe do delay write operation.
@@ -1626,7 +1644,8 @@ public class ReplicaManager implements ServerReconfigurable {
     private Map<TableBucket, ProduceLogResultForBucket> appendToLocalLog(
             Map<TableBucket, MemoryLogRecords> entriesPerBucket,
             int requiredAcks,
-            @Nullable UserContext userContext) {
+            @Nullable UserContext userContext,
+            int recoverableWriteMode) {
         Map<TableBucket, ProduceLogResultForBucket> resultForBucketMap = new HashMap<>();
         for (Map.Entry<TableBucket, MemoryLogRecords> entry : entriesPerBucket.entrySet()) {
             TableBucket tb = entry.getKey();
@@ -1640,7 +1659,8 @@ public class ReplicaManager implements ServerReconfigurable {
                 // so that if appending fails, we still account the bytes.
                 userMetrics.incBytesIn(userContext, replica.getTablePath(), records.sizeInBytes());
                 LOG.trace("Append records to local log tablet for table bucket {}", tb);
-                LogAppendInfo appendInfo = replica.appendRecordsToLeader(records, requiredAcks);
+                LogAppendInfo appendInfo =
+                        replica.appendRecordsToLeader(records, requiredAcks, recoverableWriteMode);
 
                 long baseOffset = appendInfo.firstOffset();
                 LOG.trace(

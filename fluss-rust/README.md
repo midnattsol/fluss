@@ -290,6 +290,23 @@ cargo test
 # Run integration tests (requires Docker for test cluster)
 cargo test --features integration_tests
 
+# Recoverable ProduceLog tests require a server built from this checkout.
+# Build it from the repository root using the same packaging/image steps as CI:
+cd ..
+./mvnw -B --no-transfer-progress package -pl fluss-dist -am -DskipTests
+mkdir -p docker/fluss/build-target
+cp -r build-target/* docker/fluss/build-target/
+docker build -t fluss:recoverable-test docker/fluss
+
+# Recoverable tests are in a separate opt-in feature, leaving the default
+# integration suite usable with the legacy test image. A v1 server fails these
+# tests explicitly rather than skipping them:
+cd fluss-rust
+FLUSS_IMAGE=fluss FLUSS_VERSION=recoverable-test cargo test -p fluss-rs \
+  --features recoverable_integration_tests --test test_fluss \
+  integration::prepared_log_batch::prepared_log_batch_test:: \
+  -- --nocapture
+
 # Build C++ bindings
 cd bindings/cpp && mkdir build && cd build && cmake .. && cmake --build .
 
@@ -299,6 +316,12 @@ cd bindings/python && maturin develop
 # Elixir tests
 cd bindings/elixir && mix test
 ```
+
+The recoverable-write integration cases require ProduceLog v2 and deliberately fail with an
+actionable message if the selected image does not support it.
+The ACK-loss case uses a host-side TCP proxy to drop the response after it has arrived from the
+server, then restores the caller-persisted prepared state and verifies the original offset and
+single log append.
 
 ---
 

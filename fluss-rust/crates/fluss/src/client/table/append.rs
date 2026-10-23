@@ -17,6 +17,8 @@
 
 use crate::bucketing::BucketingFunction;
 use crate::client::table::partition_getter::{PartitionGetter, get_physical_path};
+use crate::client::table::{PreparedLogBatch, PreparedLogBatchResult, RecoverableWriteMode};
+use crate::client::write::encode_prepared_arrow_batch;
 use crate::client::{WriteRecord, WriteResultFuture, WriterClient};
 use crate::error::Error::{IllegalArgument, UnexpectedError};
 use crate::error::Result;
@@ -111,6 +113,137 @@ pub struct AppendWriter {
 }
 
 impl AppendWriter {
+    /// Prepares one caller-selected bucket from an Arrow batch into immutable restartable state.
+    ///
+    /// All rows must route to `bucket_id` and, for partitioned tables, to the same physical
+    /// partition. The caller must use a stable, unique nonnegative writer id and durably manage
+    /// the next per-bucket sequence; this API does not coordinate writer ids across processes.
+    pub async fn prepare_log_batch(
+        &self,
+        batch: RecordBatch,
+        bucket_id: i32,
+        writer_id: i64,
+        batch_sequence: i32,
+    ) -> Result<PreparedLogBatch> {
+        if batch.num_rows() == 0 {
+            return Err(IllegalArgument {
+                message: "cannot prepare an empty log batch".to_string(),
+            });
+        }
+        let batch = prepare_append_record_batch(&batch, self.table_info.row_type())?;
+        let first_row = ColumnarRow::new(
+            Arc::new(batch.clone()),
+            Arc::new(self.table_info.row_type.clone()),
+            0,
+            None,
+        )?;
+        let physical_path = Arc::new(get_physical_path(
+            &self.table_path,
+            self.partition_getter.as_ref(),
+            &first_row,
+        )?);
+        let routing_bucket_count = self
+            .writer_client
+            .routing_bucket_count(&physical_path, &self.table_info)?;
+        if bucket_id < 0 || bucket_id >= routing_bucket_count {
+            return Err(IllegalArgument {
+                message: format!(
+                    "bucket {bucket_id} is outside routing count {routing_bucket_count}"
+                ),
+            });
+        }
+        let batch_arc = Arc::new(batch.clone());
+        let row_type = Arc::new(self.table_info.row_type.clone());
+        let mut row = ColumnarRow::new(batch_arc, row_type, 0, None)?;
+        for index in 0..batch.num_rows() {
+            row.set_row_id(index);
+            if self.partition_getter.is_some()
+                && get_physical_path(&self.table_path, self.partition_getter.as_ref(), &row)?
+                    != *physical_path
+            {
+                return Err(IllegalArgument {
+                    message: "prepared rows span physical partitions".to_string(),
+                });
+            }
+            if let Some(router) = &self.bucket_router {
+                if router.bucket_of(&row, routing_bucket_count)?.0 != bucket_id {
+                    return Err(IllegalArgument {
+                        message: "prepared rows span buckets or do not match bucket_id".to_string(),
+                    });
+                }
+            }
+        }
+        let records = encode_prepared_arrow_batch(
+            &self.table_info,
+            Arc::clone(&physical_path),
+            Arc::new(batch.clone()),
+            writer_id,
+            batch_sequence,
+        )?;
+        let partition_id = if physical_path.get_partition_name().is_some() {
+            Some(
+                self.writer_client
+                    .resolve_partition_id(&physical_path)
+                    .await?
+                    .ok_or_else(|| IllegalArgument {
+                        message: "prepared physical partition is unknown".to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+        PreparedLogBatch::new(
+            self.table_info.table_id,
+            partition_id,
+            bucket_id,
+            writer_id,
+            batch_sequence,
+            records,
+        )
+    }
+
+    /// Sends an immutable prepared batch using the explicit recoverable protocol mode.
+    ///
+    /// # Caller-managed durability
+    ///
+    /// Persist `batch.encode()` durably before the first network dispatch. Persist a `sending`
+    /// state transition before invoking [`RecoverableWriteMode::NewSend`]. After any attempt
+    /// that may have reached the server—including a lost response, timeout, or process crash—
+    /// restore the same state and invoke [`RecoverableWriteMode::Retry`] with the exact same
+    /// writer id, sequence, target, and bytes. Do not make a new batch or use `NewSend` again
+    /// while the outcome is uncertain. Only after this method returns `Ok` should the caller
+    /// durably persist the acknowledgment and advance its sequence/checkpoint. A returned error
+    /// is not an acknowledgment; the caller must retain the prepared state and choose whether to
+    /// retry or handle the typed error.
+    ///
+    /// Keep at most one uncertain prepared batch per writer and bucket. The server's duplicate
+    /// recognition is bounded (currently five recent sequences); this is neither a transaction
+    /// nor indefinite deduplication, and it does not coordinate caller checkpoint storage with
+    /// Fluss. The versioned encoding uses CRC32C for accidental-corruption detection, not
+    /// authentication. Treat its bytes as a Rust SDK persistence format, not a wire protocol.
+    ///
+    /// This method does not retry transport failures automatically. The prepared state is bound
+    /// to a table id and physical bucket; it is not rerouted. A peer that negotiated a ProduceLog
+    /// version below 2 is rejected before the prepared request is transmitted.
+    pub async fn send_prepared_log_batch(
+        &self,
+        batch: &PreparedLogBatch,
+        mode: RecoverableWriteMode,
+    ) -> Result<PreparedLogBatchResult> {
+        if batch.table_id() != self.table_info.table_id
+            || i32::from(batch.schema_id()) != self.table_info.schema_id
+        {
+            return Err(IllegalArgument {
+                message: "prepared batch table or schema does not match this writer".to_string(),
+            });
+        }
+        let response = self
+            .writer_client
+            .send_prepared_log_batch(&self.table_path, batch, mode)
+            .await?;
+        PreparedLogBatch::result_from_response(response, batch.partition_id(), batch.bucket_id())
+    }
+
     fn check_field_count<R: InternalRow>(&self, row: &R) -> Result<()> {
         let expected = self.table_info.get_row_type().fields().len();
         if row.get_field_count() != expected {

@@ -59,6 +59,11 @@ class ApiKeysTest {
     }
 
     @Test
+    void testProduceLogSupportsExplicitRecoveryMode() {
+        assertThat(ApiKeys.PRODUCE_LOG.highestSupportedVersion).isEqualTo((short) 2);
+    }
+
+    @Test
     void testConsumerOffsetApiKeys() {
         assertThat(ApiKeys.FIND_CONSUMER_GROUP_OWNER.id).isEqualTo((short) 1068);
         assertThat(ApiKeys.COMMIT_CONSUMER_OFFSETS.id).isEqualTo((short) 1069);

@@ -205,7 +205,11 @@ public class WriterAppendInfo {
             boolean isWriterInBatchExpired,
             boolean isAppendAsLeader) {
         return (lastBatchSeq == NO_BATCH_SEQUENCE && (isWriterInBatchExpired || !isAppendAsLeader))
-                || nextBatchSeq == lastBatchSeq + 1L
+                || isNextBatchSequence(lastBatchSeq, nextBatchSeq);
+    }
+
+    static boolean isNextBatchSequence(int lastBatchSeq, int nextBatchSeq) {
+        return nextBatchSeq == lastBatchSeq + 1L
                 || (nextBatchSeq == 0 && lastBatchSeq == Integer.MAX_VALUE);
     }
 }

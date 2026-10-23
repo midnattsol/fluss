@@ -145,6 +145,35 @@ pub struct CreateTableRequest {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateTableResponse {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateTableFromLakeRequest {
+    #[prost(message, required, tag = "1")]
+    pub table_path: PbTablePath,
+    #[prost(message, repeated, tag = "2")]
+    pub options: ::prost::alloc::vec::Vec<PbKeyValue>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateTableFromLakeResponse {
+    #[prost(message, required, tag = "1")]
+    pub table_info: PbTableInfo,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PbTableInfo {
+    #[prost(int64, required, tag = "1")]
+    pub table_id: i64,
+    #[prost(int32, required, tag = "2")]
+    pub schema_id: i32,
+    #[prost(bytes = "vec", required, tag = "3")]
+    pub table_json: ::prost::alloc::vec::Vec<u8>,
+    #[prost(int64, required, tag = "4")]
+    pub created_time: i64,
+    #[prost(int64, required, tag = "5")]
+    pub modified_time: i64,
+    #[prost(string, optional, tag = "6")]
+    pub remote_data_dir: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "7")]
+    pub bucket_count_epoch: ::core::option::Option<i64>,
+}
 /// alter table request and response
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AlterTableRequest {
@@ -295,6 +324,10 @@ pub struct ProduceLogRequest {
     pub timeout_ms: i32,
     #[prost(message, repeated, tag = "4")]
     pub buckets_req: ::prost::alloc::vec::Vec<PbProduceLogReqForBucket>,
+    /// Version 2: Required for recoverable appends; 1 = new send, 2 = retry. Unset preserves the
+    /// ordinary PRODUCE_LOG behavior. Clients must not downgrade a request carrying this field.
+    #[prost(int32, optional, tag = "5")]
+    pub recovery_mode: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProduceLogResponse {
